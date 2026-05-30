@@ -36,6 +36,12 @@ RSI_PERIOD = 14           # RSIの計算期間（参考情報）
 # 例: 0.02 にすると約0.02%（USD/JPY 159円で約3pips）の余裕を持たせる。
 HYSTERESIS_PCT = 0.0
 
+# 最新足がこの分数より古ければ「市場クローズ中」とみなして何もせず終了する。
+# 土日・祝日（クリスマスや年末年始など）はFX市場が止まり足が更新されないため、
+# 無駄な判定をスキップする。yfinance の配信遅延を考慮して余裕を持たせた値。
+# 0 で無効（常に判定する）。
+STALE_MINUTES = 90
+
 STATE_FILE = Path(__file__).with_name("state.json")
 TOKYO = ZoneInfo("Asia/Tokyo")
 WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
@@ -117,6 +123,24 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None) -> dict | None:
     if len(close) < LONG_SMA:
         return None
 
+    # 最新足の時刻（tz-aware に正規化）を取得
+    last_ts = close.index[-1]
+    if isinstance(last_ts, pd.Timestamp):
+        last_ts = last_ts.tz_localize("UTC") if last_ts.tzinfo is None else last_ts
+        last_ts = last_ts.tz_convert(TOKYO)
+
+        # 最新足が古すぎる＝市場クローズ中（土日・祝日）なら何もせず終了
+        if STALE_MINUTES > 0:
+            age_min = (datetime.now(TOKYO) - last_ts).total_seconds() / 60.0
+            if age_min > STALE_MINUTES:
+                print(
+                    f"最新足が {age_min:.0f}分前で古いため市場クローズ中と判断しスキップします。"
+                )
+                return None
+        ts_str = last_ts.strftime("%Y-%m-%d %H:%M JST")
+    else:
+        ts_str = str(last_ts)
+
     short_ma = close.rolling(SHORT_SMA).mean().iloc[-1]
     long_ma = close.rolling(LONG_SMA).mean().iloc[-1]
 
@@ -135,16 +159,6 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None) -> dict | None:
         state = prev_state
     else:
         state = raw_state
-
-    # 最新足の時刻を日本時間に変換（tz-naive の場合も考慮）
-    last_ts = close.index[-1]
-    if isinstance(last_ts, pd.Timestamp):
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.tz_localize("UTC")
-        last_ts = last_ts.tz_convert(TOKYO)
-        ts_str = last_ts.strftime("%Y-%m-%d %H:%M JST")
-    else:
-        ts_str = str(last_ts)
 
     return {
         "state": state,

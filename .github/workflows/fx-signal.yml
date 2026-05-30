@@ -2,8 +2,14 @@ name: fx-signal
 
 on:
   schedule:
-    # 5分おきに実行（UTC基準。GitHub Actions の cron は遅延することがある）
-    - cron: "*/5 * * * *"
+    # FX市場は土日クローズなので、開いている時間帯だけ5分おきに実行する。
+    # cron は UTC 基準。GitHub Actions の cron は混雑時に遅延することがある。
+    #   月〜金（UTC終日）= 取引時間の大部分をカバー
+    - cron: "*/5 * * * 1-5"
+    #   日曜21:00(UTC)以降 = 月曜早朝(JST)の週明けオープン分
+    - cron: "*/5 21-23 * * 0"
+    # ※ 土曜(UTC)と日曜の日中(UTC)は市場クローズのため実行しない。
+    #   端境や祝日は fx_signal.py 側の STALE_MINUTES ガードでも二重に弾く。
   workflow_dispatch: {}   # 手動テスト用
 
 # 実行の重複を防ぐ（前の実行が走っていてもキャンセルせず待たせない）

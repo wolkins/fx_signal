@@ -86,7 +86,9 @@ python fx_signal.py
 
 `.github/workflows/fx-signal.yml` が以下を行います。
 
-- `cron: "*/5 * * * *"` で5分おきに実行（＋手動実行用の `workflow_dispatch`）。
+- FX市場が開いている時間帯のみ5分おきに実行（＋手動実行用の `workflow_dispatch`）。
+  土曜と日曜日中（UTC）は実行しません。祝日など端境は `fx_signal.py` の
+  `STALE_MINUTES` ガードが「最新足が古い＝市場クローズ」を検知して二重に弾きます。
 - `python fx_signal.py` を実行し、状態変化があれば Slack 通知。
 - `state.json` に差分があれば commit & push（差分が無ければスキップ）。
 - `concurrency` で実行の重複を防止。
