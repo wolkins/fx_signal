@@ -1,0 +1,51 @@
+name: fx-signal
+
+on:
+  schedule:
+    # 5分おきに実行（UTC基準。GitHub Actions の cron は遅延することがある）
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # 手動テスト用
+
+# 実行の重複を防ぐ（前の実行が走っていてもキャンセルせず待たせない）
+concurrency:
+  group: fx-signal
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # state.json を commit & push するために必要
+
+jobs:
+  monitor:
+    # macOS は無料枠を10倍消費するため必ず ubuntu-latest を使う
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run signal monitor
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python fx_signal.py
+
+      - name: Commit state if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          # 差分が無い時は commit しない
+          if git diff --cached --quiet; then
+            echo "state.json に変化なし — commit をスキップします。"
+          else
+            git commit -m "chore: update state.json [skip ci]"
+            git push
+          fi
