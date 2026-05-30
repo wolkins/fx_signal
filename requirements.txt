@@ -1,8 +1,10 @@
 # バージョン固定: 自動の最新追従はせず、定期的に「意図して」上げる方針。
 # 範囲は「動作確認済みの下限 〜 次のメジャー未満」。更新時は fx_signal.py と
-# backtest.py が動くことを確認してから引き上げる。
+# backtest.py、および python test_fx_signal.py が通ることを確認してから引き上げる。
 # （最終確認: 2026-05 / yfinance 1.4.1, pandas 3.0.3, requests 2.34.2, anthropic 0.105.2）
 yfinance>=1.4,<2
+# pandas は 2系→3系で破壊的変更あり。使用APIは rolling/diff/ewm/tz_convert と安定だが、
+# バージョンを上げる時はローカルで一度 test_fx_signal.py を通してから上げること。
 pandas>=2.2,<4
 requests>=2.32,<3
 anthropic>=0.105,<1

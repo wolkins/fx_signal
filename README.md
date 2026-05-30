@@ -174,6 +174,20 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 python fx_signal.py
 ```
 
+> ⚠️ **キー入れ忘れの儀式:** `RISK_FILTER_ENABLED=True` のまま `ANTHROPIC_API_KEY` を
+> 入れ忘れると `status="no_api_key"`（=意図的オフ扱い）になり、フッターも出ず**静かに無効**になります。
+> これは仕様どおりの挙動です。「オンにしたつもりが鳴らない」を防ぐため、キー登録後に一度
+> シグナルを発火させ、`risk_log.jsonl` の `status` が `ok` になっているか一度だけ確認してください。
+
+### 回帰テスト
+
+`test_fx_signal.py` が status 分岐・スキーマ検知・フッター条件・決定論一致などを固定します
+（ネット・APIキー不要、作業ツリーを汚しません）。
+
+```bash
+python test_fx_signal.py     # pytest 不要。pytest があれば `pytest test_fx_signal.py` でも可
+```
+
 ---
 
 ## やらないこと（範囲外）
