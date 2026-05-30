@@ -12,16 +12,108 @@
     python backtest.py                  # PAIRS 全ペアを 60日・5分足で要約
     python backtest.py 60d 5m           # 全ペアを期間/足種指定で要約
     python backtest.py USDJPY=X 60d 5m  # 単一ペアを詳細(転換履歴つき)で
+
+データ源（--source）:
+    yfinance（既定）… キー不要。ただし5分足は約60日が上限（Yahooの仕様）。
+    dukascopy        … キー不要・約2003年〜。5分足のまま長期を遡れる。
+                       要 `pip install -r requirements-backtest.txt`。取得は重いので
+                       .cache/ にCSVキャッシュして2回目以降は即時。
+    例: python backtest.py --source dukascopy USDJPY=X 1y 5m
 """
 
 from __future__ import annotations
 
+import re
 import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pandas as pd
 import yfinance as yf
 
 import fx_signal as fx  # 本体の定数とロジックを再利用
+
+CACHE_DIR = Path(__file__).with_name(".cache")
+
+
+# ─────────────────────────────────────────────────────────────
+# データ取得（ソース切替）。返すのは "Close" 列を持つ DataFrame。
+# ─────────────────────────────────────────────────────────────
+def fetch_history(ticker: str, period: str, interval: str, source: str):
+    if source == "dukascopy":
+        return _fetch_dukascopy(ticker, period, interval)
+    if source == "yfinance":
+        return _fetch_yfinance(ticker, period, interval)
+    raise ValueError(f"未対応の --source: {source}（yfinance / dukascopy）")
+
+
+def _fetch_yfinance(ticker: str, period: str, interval: str):
+    df = yf.download(
+        ticker, period=period, interval=interval, progress=False, auto_adjust=True
+    )
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def _parse_period(period: str) -> timedelta:
+    """'60d'/'2y'/'6mo'/'3wk' などを timedelta に変換。"""
+    m = re.fullmatch(r"\s*(\d+)\s*(d|wk|mo|y)\s*", period)
+    if not m:
+        raise ValueError(f"未対応の period: {period}（例 60d / 1y / 6mo / 3wk）")
+    n = int(m.group(1))
+    days = {"d": 1, "wk": 7, "mo": 30, "y": 365}[m.group(2)]
+    return timedelta(days=n * days)
+
+
+def _fetch_dukascopy(ticker: str, period: str, interval: str):
+    """Dukascopy から OHLC を取得（キー不要・深い履歴）。CSVキャッシュ付き。"""
+    try:
+        import logging
+
+        import dukascopy_python as dk
+
+        # 取得の進捗ログが煩いので抑える（ERROR以上のみ・親へ伝播させない）
+        _dklog = logging.getLogger("DUKASCRIPT")
+        _dklog.setLevel(logging.ERROR)
+        _dklog.propagate = False
+    except ImportError as exc:
+        raise SystemExit(
+            "dukascopy-python が必要です: pip install -r requirements-backtest.txt"
+        ) from exc
+
+    interval_map = {
+        "1m": dk.INTERVAL_MIN_1,
+        "5m": dk.INTERVAL_MIN_5,
+        "15m": dk.INTERVAL_MIN_15,
+        "30m": dk.INTERVAL_MIN_30,
+        "1h": dk.INTERVAL_HOUR_1,
+        "4h": dk.INTERVAL_HOUR_4,
+        "1d": dk.INTERVAL_DAY_1,
+        "1wk": dk.INTERVAL_WEEK_1,
+    }
+    if interval not in interval_map:
+        raise ValueError(f"dukascopy 未対応の足種: {interval}")
+
+    instrument = fx.pair_label(ticker)  # 'USD/JPY' 等（Dukascopyの銘柄名と一致）
+    end = datetime.now(timezone.utc)
+    start = end - _parse_period(period)
+
+    code = fx.pair_code(ticker)
+    cache = CACHE_DIR / f"dukascopy_{code}_{interval}_{start.date()}_{end.date()}.csv"
+    if cache.exists():
+        return pd.read_csv(cache, index_col=0, parse_dates=True)
+
+    raw = dk.fetch(instrument, interval_map[interval], dk.OFFER_SIDE_BID, start, end)
+    if raw is None or len(raw) == 0:
+        return None
+    # close/high/... → Close/High/...（既存ロジックは "Close" を参照）
+    df = raw.rename(columns=str.capitalize)
+    CACHE_DIR.mkdir(exist_ok=True)
+    df.to_csv(cache)
+    return df
 
 
 def _states(close: pd.Series) -> list[tuple[pd.Timestamp, str, float]]:
@@ -57,17 +149,15 @@ def _changes(states) -> list[tuple[pd.Timestamp, str, str, float]]:
     ]
 
 
-def backtest_pair(ticker: str, period: str, interval: str, detail: bool) -> int:
+def backtest_pair(
+    ticker: str, period: str, interval: str, detail: bool, source: str
+) -> int:
     label = fx.pair_label(ticker)
     dec = fx.pair_decimals(ticker)
-    df = yf.download(
-        ticker, period=period, interval=interval, progress=False, auto_adjust=True
-    )
-    if df is None or df.empty:
+    df = fetch_history(ticker, period, interval, source)
+    if df is None or df.empty or "Close" not in df.columns:
         print(f"[{label}] データを取得できませんでした。")
         return 1
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
     close = df["Close"].dropna()
     if len(close) < fx.LONG_SMA + 1:
         print(f"[{label}] 本数不足: {len(close)}本（長期SMA {fx.LONG_SMA} に届かず）")
@@ -131,21 +221,30 @@ def _td(td: pd.Timedelta) -> str:
 
 
 def main(argv: list[str]) -> int:
-    # 引数解析: 先頭が "XXX=X" ならそのペアを詳細表示。残りは period, interval。
-    args = list(argv)
-    single = None
-    if args and args[0].endswith("=X"):
-        single = args.pop(0)
+    # 引数解析: --source <yfinance|dukascopy>、先頭が "XXX=X" ならそのペアを詳細表示。
+    # 残りの位置引数は period, interval。
+    args: list[str] = []
+    source = "yfinance"
+    it = iter(argv)
+    for a in it:
+        if a == "--source":
+            source = next(it, "yfinance")
+        elif a.startswith("--source="):
+            source = a.split("=", 1)[1]
+        else:
+            args.append(a)
+
+    single = args.pop(0) if args and args[0].endswith("=X") else None
     period = args[0] if len(args) > 0 else "60d"
     interval = args[1] if len(args) > 1 else fx.INTERVAL
 
     tickers = [single] if single else fx.PAIRS
     print(f"バックテスト: {', '.join(fx.pair_label(t) for t in tickers)}"
-          f"  / period={period} / interval={interval}")
+          f"  / source={source} / period={period} / interval={interval}")
     rc = 0
     for t in tickers:
         try:
-            rc |= backtest_pair(t, period, interval, detail=bool(single))
+            rc |= backtest_pair(t, period, interval, detail=bool(single), source=source)
         except Exception as exc:  # noqa: BLE001
             print(f"[{fx.pair_label(t)}] エラー: {exc}")
             rc = 1

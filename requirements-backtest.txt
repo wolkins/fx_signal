@@ -1,0 +1,5 @@
+# バックテスト専用の任意依存（本番ボット/CIには不要）。
+# `python backtest.py --source dukascopy ...` で5分足の長期履歴を使う時だけ入れる。
+#   pip install -r requirements-backtest.txt
+# バージョンは固定（サードパーティ製。サイト仕様変更で壊れ得るため意図的に上げる）。
+dukascopy-python>=4,<5

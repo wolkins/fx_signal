@@ -96,6 +96,24 @@ python backtest.py 90d 15m          # 期間/足種を指定して全ペア
 python backtest.py USDJPY=X 60d 5m  # 単一ペアを転換履歴つきで詳細表示
 ```
 
+#### データ源の切り替え（`--source`）
+
+| source | キー | 特徴 |
+|--------|:---:|------|
+| `yfinance`（既定） | 不要 | 手軽。ただし**5分足は約60日が上限**（Yahooの仕様） |
+| `dukascopy` | 不要 | **約2003年〜**。**5分足のまま長期**を遡れる（稼働ボットと同じ戦略で過去検証可） |
+
+`dukascopy` を使うには任意依存を入れます（本番ボット/CIには不要）:
+
+```bash
+pip install -r requirements-backtest.txt
+python backtest.py --source dukascopy USDJPY=X 1y 5m   # 5分足で1年前まで
+```
+
+- 取得は重いので `.cache/`（gitignore済み）にCSVキャッシュし、2回目以降は即時。
+- データは Dukascopy（銀行）の流動性ベースで、稼働ボットの yfinance とは**別ソース**。
+  SMAクロスの検証用途では差は小さいですが「同一データではない」点は留意。
+
 ---
 
 ## GitHub Actions での自動実行
