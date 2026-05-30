@@ -49,22 +49,23 @@ CURRENCIES = ("USD", "JPY")
 TARGET_IMPACTS = ("High",)
 
 # 経済指標カレンダー（APIキー不要を優先。上から順に到達確認し、使えるものを採用）
-#   1. Forex Factory 週次JSON（キー不要・稼働確認済み）
+#   1. Forex Factory 週次JSON（キー不要・稼働確認済み・全通貨を一括取得）
 #   2. JBlanked（※APIキーが必要なため、キー無し環境では到達しても401で失敗扱い）
+# type:
+#   "all"          … 1リクエストで全通貨のイベントを返す（FF）。
+#   "per_currency" … URL の {cur} を通貨ごとに埋めて取得し、対象通貨ぶんを集約する。
+#                    複数ペア対応のため、固定通貨ではなく監視ペアの通貨で動的に組む。
 CALENDAR_SOURCES = (
     {
         "name": "forexfactory",
+        "type": "all",
         "url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
         "parser": "ff",
     },
     {
-        "name": "jblanked_usd",
-        "url": "https://www.jblanked.com/news/api/forex-factory/calendar/week/?currency=USD&impact=High",
-        "parser": "jblanked",
-    },
-    {
-        "name": "jblanked_jpy",
-        "url": "https://www.jblanked.com/news/api/forex-factory/calendar/week/?currency=JPY&impact=High",
+        "name": "jblanked",
+        "type": "per_currency",
+        "url": "https://www.jblanked.com/news/api/forex-factory/calendar/week/?currency={cur}&impact=High",
         "parser": "jblanked",
     },
 )
@@ -99,7 +100,9 @@ def _parse_ff(data) -> list[dict]:
         try:
             currency = str(item.get("country", "")).upper()
             impact = str(item.get("impact", ""))
-            if currency not in CURRENCIES or impact not in TARGET_IMPACTS:
+            # 通貨での絞り込みはペアごとに呼び出し側(_relevant_events)で行う。
+            # ここでは全通貨の High イベントを保持する（複数ペア対応）。
+            if impact not in TARGET_IMPACTS:
                 continue
             dt = _parse_dt(item.get("date"))
             if dt is None:
@@ -130,8 +133,7 @@ def _parse_jblanked(data) -> list[dict]:
                 continue
             currency = str(item.get("currency") or item.get("country") or "").upper()
             impact = str(item.get("impact") or item.get("strength") or "")
-            if currency and currency not in CURRENCIES:
-                continue
+            # 通貨絞り込みは呼び出し側で行う（全通貨の High を保持）。
             if impact and impact not in TARGET_IMPACTS:
                 continue
             dt = _parse_dt(item.get("date") or item.get("datetime") or item.get("time"))
@@ -168,33 +170,47 @@ def _parse_dt(value) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
-def _fetch_calendar() -> list[dict]:
-    """到達できたソースから USD/JPY High イベント一覧を取得する。
+def _fetch_one(url: str) -> object:
+    resp = requests.get(url, headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
+
+def _fetch_calendar(currencies: tuple[str, ...]) -> list[dict]:
+    """到達できたソースから High インパクトのイベント一覧を取得する。
+
+    - type="all" のソース（FF）は1リクエストで全通貨を返すのでそのまま採用。
+    - type="per_currency" のソース（jblanked）は、対象 currencies ごとに URL を組んで
+      取得し集約する（複数ペアでも対象通貨を取りこぼさない）。
     すべて失敗したら RuntimeError を送出（呼び出し側で握りつぶす）。
     """
     last_error: Exception | None = None
     for src in CALENDAR_SOURCES:
         try:
-            resp = requests.get(src["url"], headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
-            events = _PARSERS[src["parser"]](resp.json())
-            if events:
-                return events
-            # 200だが0件（休場週など）。次ソースは試さず空として扱う。
-            return events
+            parser = _PARSERS[src["parser"]]
+            if src.get("type") == "per_currency":
+                agg: list[dict] = []
+                for cur in currencies:
+                    agg.extend(parser(_fetch_one(src["url"].format(cur=cur))))
+                return agg  # 到達できた（0件＝休場週でも採用）
+            # type="all": 全通貨を一括取得
+            return parser(_fetch_one(src["url"]))
         except Exception as exc:  # noqa: BLE001 - 1ソースの失敗で全体は止めない
             last_error = exc
             continue
     raise RuntimeError(f"全カレンダーソースが利用不可: {last_error}")
 
 
-def _relevant_events(events: list[dict], now_utc: datetime) -> list[dict]:
-    """警戒ウィンドウ内（直近過去〜数時間先）のイベントだけを抽出し時刻順に並べる。"""
+def _relevant_events(
+    events: list[dict], now_utc: datetime, currencies: tuple[str, ...]
+) -> list[dict]:
+    """対象通貨かつ警戒ウィンドウ内のイベントを抽出し時刻順に並べる。"""
     lo = now_utc - timedelta(hours=RISK_LOOKBACK_HOURS)
     hi = now_utc + timedelta(hours=RISK_LOOKAHEAD_HOURS)
     out: list[dict] = []
     for ev in events:
+        if currencies and ev["currency"] not in currencies:
+            continue
         dt = ev["dt_utc"]
         if lo <= dt <= hi:
             delta_min = round((dt - now_utc).total_seconds() / 60.0)
@@ -215,8 +231,9 @@ def _relevant_events(events: list[dict], now_utc: datetime) -> list[dict]:
 # LLM 呼び出し（テキストの定性解釈のみ）
 # ─────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
-    "あなたはFXのリスク管理アシスタントです。USD/JPYのトレードシグナルに添える"
-    "『定性的なリスク評価』だけを行います。売買の是非・価格予測・指標計算・日時計算は"
+    "あなたはFXのリスク管理アシスタントです。入力の pair フィールドで指定された"
+    "通貨ペアのトレードシグナルに添える『定性的なリスク評価』だけを行います。"
+    "売買の是非・価格予測・指標計算・日時計算は"
     "一切しません（それらは別システムが決定論的に処理済み）。\n"
     "与えられた『直近・直後の重要経済イベント一覧』と『直近の価格変化率』から、"
     "(1)イベントによるボラティリティ拡大リスク (2)急変動による為替介入の可能性、を評価してください。\n"
@@ -333,11 +350,18 @@ def _log(entry: dict) -> None:
 # ─────────────────────────────────────────────────────────────
 # 公開エントリ
 # ─────────────────────────────────────────────────────────────
-def assess_risk(signal_info: dict) -> dict:
+def assess_risk(
+    signal_info: dict,
+    currencies: tuple[str, ...] | None = None,
+    pair_label: str | None = None,
+) -> dict:
     """シグナル発火時のリスク評価を返す。
 
     Args:
         signal_info: fx_signal の判定結果 dict（state, price, 価格変化率などを含む）。
+        currencies: 対象通貨ペアの通貨（例 ('AUD','JPY')）。カレンダー絞り込みに使う。
+            None なら既定の CURRENCIES。
+        pair_label: 通貨ペア表示名（例 'AUD/JPY'）。LLM入力に渡す。
 
     Returns:
         常に dict を返し、例外は決して送出しない。失敗時は UNKNOWN_RISK 相当。
@@ -349,18 +373,20 @@ def assess_risk(signal_info: dict) -> dict:
 
     result = {**UNKNOWN_RISK, "upcoming_events": []}
     now_utc = datetime.now(timezone.utc)
+    target_currencies = tuple(currencies) if currencies else CURRENCIES
 
     # 1) カレンダー取得＋時間計算（決定論的）。失敗は握りつぶし「リスク不明」で続行。
     try:
-        all_events = _fetch_calendar()
+        all_events = _fetch_calendar(target_currencies)
     except Exception:
         return result  # カレンダー到達不可 → リスク不明（本体は通常通り）
 
-    upcoming = _relevant_events(all_events, now_utc)
+    upcoming = _relevant_events(all_events, now_utc, target_currencies)
     result["upcoming_events"] = upcoming
 
     # 2) LLM へ渡す構造化入力を組み立て（日時計算は上で済ませてある）
     payload = {
+        "pair": pair_label or "/".join(target_currencies),
         "signal": {
             "state": signal_info.get("state"),
             "price": signal_info.get("price"),
@@ -380,6 +406,7 @@ def assess_risk(signal_info: dict) -> dict:
     _log(
         {
             "timestamp": now_utc.astimezone(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
+            "pair": payload["pair"],
             "model": LLM_MODEL,
             "input": payload,
             "output_raw": raw,

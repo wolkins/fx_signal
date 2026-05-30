@@ -27,7 +27,9 @@ import yfinance as yf
 # ─────────────────────────────────────────────────────────────
 # 設定（ここを変えれば挙動を調整できる）
 # ─────────────────────────────────────────────────────────────
-TICKER = "USDJPY=X"      # yfinance のティッカー
+# 監視する通貨ペア（yfinanceティッカー）のリスト。増減はここだけで完結する。
+# ラベル・小数桁・カレンダー対象通貨はティッカーから自動導出する（下のヘルパ参照）。
+PAIRS = ["USDJPY=X", "AUDJPY=X"]
 INTERVAL = "5m"           # 足種（例: "5m", "15m", "1h", "1d"）
 PERIOD = "5d"             # 取得期間
 SHORT_SMA = 20            # 短期SMAの本数
@@ -47,15 +49,45 @@ HYSTERESIS_PCT = 0.05
 # 0 で無効（常に判定する）。
 STALE_MINUTES = 90
 
-STATE_FILE = Path(__file__).with_name("state.json")
 TOKYO = ZoneInfo("Asia/Tokyo")
 WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
 
 
 # ─────────────────────────────────────────────────────────────
+# 通貨ペアのメタ情報をティッカーから導出
+# ─────────────────────────────────────────────────────────────
+def pair_code(ticker: str) -> str:
+    """'USDJPY=X' → 'USDJPY'。"""
+    return ticker.replace("=X", "").upper()
+
+
+def pair_label(ticker: str) -> str:
+    """'USDJPY=X' → 'USD/JPY'。"""
+    code = pair_code(ticker)
+    return f"{code[:3]}/{code[3:6]}" if len(code) >= 6 else code
+
+
+def pair_currencies(ticker: str) -> tuple[str, ...]:
+    """'USDJPY=X' → ('USD', 'JPY')。リスク層のカレンダー対象通貨。"""
+    code = pair_code(ticker)
+    return (code[:3], code[3:6]) if len(code) >= 6 else (code,)
+
+
+def pair_decimals(ticker: str) -> int:
+    """表示小数桁。JPYクオート(例 159.255)は3桁、それ以外(例 1.16591)は5桁。"""
+    code = pair_code(ticker)
+    return 3 if code[3:6] == "JPY" else 5
+
+
+def state_path(ticker: str) -> Path:
+    """ペアごとの状態ファイル。'USDJPY=X' → state_USDJPY.json。"""
+    return Path(__file__).with_name(f"state_{pair_code(ticker)}.json")
+
+
+# ─────────────────────────────────────────────────────────────
 # データ取得
 # ─────────────────────────────────────────────────────────────
-def fetch_data() -> pd.DataFrame:
+def fetch_data(ticker: str) -> pd.DataFrame:
     """yfinance から価格データを取得し、列を平坦化して返す。
 
     通信失敗や yfinance 側のエラーで例外が出てもジョブを落とさず、空の
@@ -63,7 +95,7 @@ def fetch_data() -> pd.DataFrame:
     """
     try:
         df = yf.download(
-            TICKER,
+            ticker,
             interval=INTERVAL,
             period=PERIOD,
             progress=False,
@@ -195,24 +227,24 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None) -> dict | None:
 # ─────────────────────────────────────────────────────────────
 # 状態の保存・読み込み
 # ─────────────────────────────────────────────────────────────
-def load_state() -> dict | None:
-    if not STATE_FILE.exists():
+def load_state(path: Path) -> dict | None:
+    if not path.exists():
         return None
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        print(f"state.json の読み込みに失敗: {exc}", file=sys.stderr)
+        print(f"{path.name} の読み込みに失敗: {exc}", file=sys.stderr)
         return None
 
 
-def save_state(info: dict) -> None:
+def save_state(path: Path, info: dict) -> None:
     payload = {
         "state": info["state"],
         "price": info["price"],
         "time": info["time"],
         "updated_at": datetime.now(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
     }
-    STATE_FILE.write_text(
+    path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
 
@@ -262,27 +294,30 @@ def _risk_prefix(risk: dict | None) -> str:
 def format_message(
     info: dict,
     *,
+    label: str,
+    decimals: int = 3,
     first_run: bool = False,
     risk: dict | None = None,
     info_only: bool = False,
 ) -> str:
-    label = "買い目線 📈" if info["state"] == "LONG" else "売り目線 📉"
+    stance = "買い目線 📈" if info["state"] == "LONG" else "売り目線 📉"
     rsi = info["rsi"]
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
 
     if first_run:
-        header = "🔔 USD/JPY 監視を開始しました"
+        header = f"🔔 {label} 監視を開始しました"
     elif info_only:
         # 高リスクのためシグナルを「情報のみ」に格下げ（発注は促さない）
-        header = "🛑 USD/JPY シグナル【情報のみ・発注見送り推奨】"
+        header = f"🛑 {label} シグナル【情報のみ・発注見送り推奨】"
     else:
-        header = "⚡ USD/JPY シグナル変化"
+        header = f"⚡ {label} シグナル変化"
 
     body = (
         f"{header}\n"
-        f"状態: *{info['state']}*（{label}）\n"
-        f"価格: {info['price']:.3f}\n"
-        f"SMA{SHORT_SMA}: {info['short_ma']:.3f} / SMA{LONG_SMA}: {info['long_ma']:.3f}\n"
+        f"状態: *{info['state']}*（{stance}）\n"
+        f"価格: {info['price']:.{decimals}f}\n"
+        f"SMA{SHORT_SMA}: {info['short_ma']:.{decimals}f}"
+        f" / SMA{LONG_SMA}: {info['long_ma']:.{decimals}f}\n"
         f"RSI{RSI_PERIOD}: {rsi_str}\n"
         f"最新足: {info['time']}（{INTERVAL}）"
     )
@@ -292,24 +327,34 @@ def format_message(
 # ─────────────────────────────────────────────────────────────
 # メイン
 # ─────────────────────────────────────────────────────────────
-def main() -> int:
-    prev = load_state()
+def process_pair(ticker: str) -> None:
+    """1通貨ペアを判定し、状態変化時のみ通知する。
+
+    ペアごとに独立した state_<PAIR>.json で状態を管理する。
+    1ペアの処理が例外を投げても、呼び出し側で他ペアは止めない。
+    """
+    label = pair_label(ticker)
+    decimals = pair_decimals(ticker)
+    currencies = pair_currencies(ticker)
+    path = state_path(ticker)
+
+    prev = load_state(path)
     prev_state = prev.get("state") if prev else None
 
-    df = fetch_data()
+    df = fetch_data(ticker)
     info = evaluate(df, prev_state=prev_state)
 
     if info is None:
         # データが空 or 本数不足（市場クローズ中など）はクラッシュさせず正常終了
-        print("データ不足のため判定をスキップしました（市場クローズ中など）。")
-        return 0
+        print(f"[{label}] データ不足のため判定をスキップ（市場クローズ中など）。")
+        return
 
     if prev is None:
         # 初回起動: 監視開始を1回だけ通知して状態を保存
-        notify(format_message(info, first_run=True))
-        save_state(info)
-        print(f"初回起動: 状態を {info['state']} で保存しました。")
-        return 0
+        notify(format_message(info, label=label, decimals=decimals, first_run=True))
+        save_state(path, info)
+        print(f"[{label}] 初回起動: 状態を {info['state']} で保存しました。")
+        return
 
     if prev.get("state") != info["state"]:
         # 状態が変わった瞬間だけ通知。
@@ -320,21 +365,31 @@ def main() -> int:
         suppress = False
         try:
             import risk_filter  # 遅延 import（付加層）
-            risk = risk_filter.assess_risk(info)
+            risk = risk_filter.assess_risk(
+                info, currencies=currencies, pair_label=label
+            )
             suppress = risk_filter.RISK_SUPPRESS_SIGNALS
         except Exception as exc:  # noqa: BLE001 - 付加層の失敗で本体を止めない
-            print(f"リスク層でエラー（リスク不明として続行）: {exc}", file=sys.stderr)
+            print(f"[{label}] リスク層でエラー（リスク不明で続行）: {exc}", file=sys.stderr)
             risk = None
 
         info_only = bool(risk and suppress and risk.get("risk_level") == "high")
-        notify(format_message(info, risk=risk, info_only=info_only))
-        save_state(info)
+        notify(format_message(info, label=label, decimals=decimals, risk=risk, info_only=info_only))
+        save_state(path, info)
         risk_level = risk.get("risk_level") if risk else "unknown"
-        print(f"状態変化: {prev.get('state')} → {info['state']} / リスク: {risk_level}")
+        print(f"[{label}] 状態変化: {prev.get('state')} → {info['state']} / リスク: {risk_level}")
     else:
         # 同じ状態が続く間は通知しない（チャタリング防止）
-        print(f"状態変化なし: {info['state']}（通知スキップ）")
+        print(f"[{label}] 状態変化なし: {info['state']}（通知スキップ）")
 
+
+def main() -> int:
+    # 各ペアを独立処理。1ペアの失敗が他ペアの監視を止めないようにする。
+    for ticker in PAIRS:
+        try:
+            process_pair(ticker)
+        except Exception as exc:  # noqa: BLE001 - 1ペアの失敗で全体を止めない
+            print(f"[{pair_label(ticker)}] 処理中にエラー（スキップ）: {exc}", file=sys.stderr)
     return 0
 
 
