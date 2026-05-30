@@ -1,0 +1,43 @@
+name: test
+
+# 回帰テストの自動実行。監視用の fx-signal.yml（5分cron）とは別責務の独立ワークフロー。
+# push / PR のたびに test_fx_signal.py を走らせ、デグレを記憶に頼らず弾く。
+on:
+  push:
+    # 監視ジョブが commit する状態ファイル類だけの変更ではテストを回さない。
+    # （bot の commit は "[skip ci]" 付きなので元々起動しないが、二重の保険）
+    paths-ignore:
+      - "state_*.json"
+      - "risk_log.jsonl"
+  pull_request: {}
+  workflow_dispatch: {}
+
+# テストは読み取りのみ。書き込み権限は与えない。
+permissions:
+  contents: read
+
+# 同一refの古い実行はキャンセルして無駄打ちを防ぐ。
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest   # 無料枠を10倍消費する macOS は使わない
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run regression tests
+        # ネット・APIキー不要（yfinance/カレンダー/LLMは未呼び出し or モック）。
+        # 失敗時は非ゼロ終了でジョブが落ちる。
+        run: python test_fx_signal.py
