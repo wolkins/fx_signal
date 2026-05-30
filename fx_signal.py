@@ -29,7 +29,7 @@ import yfinance as yf
 # ─────────────────────────────────────────────────────────────
 # 監視する通貨ペア（yfinanceティッカー）のリスト。増減はここだけで完結する。
 # ラベル・小数桁・カレンダー対象通貨はティッカーから自動導出する（下のヘルパ参照）。
-PAIRS = ["USDJPY=X", "AUDJPY=X"]
+PAIRS = ["USDJPY=X", "AUDJPY=X", "NZDJPY=X"]
 INTERVAL = "5m"           # 足種（例: "5m", "15m", "1h", "1d"）
 PERIOD = "5d"             # 取得期間
 SHORT_SMA = 20            # 短期SMAの本数
