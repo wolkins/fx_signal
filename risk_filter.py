@@ -15,6 +15,15 @@
 - `RISK_FILTER_ENABLED = False` で丸ごと無効化できる。
 - ANTHROPIC_API_KEY 未設定でも本体は動く（リスク層だけスキップ）。
 
+返り値の status でサイレント故障を可視化する（"unknown" 一括に畳まない）:
+    "ok"                   … LLMが評価し正規化に成功
+    "disabled"             … RISK_FILTER_ENABLED=False
+    "no_api_key"           … 有効だが APIキー未設定 / anthropic SDK 未導入
+    "calendar_unavailable" … 全カレンダーソースが取得失敗
+    "calendar_schema"      … 取得は成功したがフィードの構造が認識できない
+    "llm_failed"           … LLM呼び出しが例外 / 応答なし
+    "parse_failed"         … LLM応答はあったがJSON正規化に失敗
+
 公開エントリは assess_risk() ただ1つ。本体 fx_signal.py からはこれを呼ぶだけ。
 """
 
@@ -22,11 +31,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+
+
+# カレンダー取得の失敗種別を区別するための例外
+class CalendarUnavailable(Exception):
+    """全ソースが到達不能/通信失敗（リスク不明だが構造の問題ではない）。"""
+
+
+class CalendarSchemaError(Exception):
+    """到達はできたがフィードの構造が認識できない（フィールド名変更など）。"""
 
 # ─────────────────────────────────────────────────────────────
 # 設定フラグ（ここに集約）
@@ -35,6 +54,11 @@ RISK_FILTER_ENABLED = True      # False でリスク層を丸ごと無効化
 RISK_SUPPRESS_SIGNALS = False   # True かつ risk_level=high の時だけシグナルを情報のみに格下げ
 RISK_LOOKAHEAD_HOURS = 6        # 何時間先までのイベントを警戒対象にするか
 RISK_LOOKBACK_HOURS = 1         # 直近何時間前までの「通過済みイベント」も考慮するか
+
+# 改善5（任意・既定OFF）: 警戒イベントが0件かつ値動きが穏やかなら、LLMを呼ばず
+# 決定論的に low を返してコストを節約する。ONでも監査ログは残す（llm_skipped=True）。
+RISK_SKIP_LLM_WHEN_QUIET = False
+RISK_QUIET_PCT = 0.3            # |直近1h変化率| がこの%未満を「穏やか」とみなす
 
 # LLM 設定（最安・最速ティア。最新IDは docs.claude.com で確認: 2026-05 時点 Haiku 4.5）
 LLM_MODEL = "claude-haiku-4-5"
@@ -76,10 +100,14 @@ HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (fx-signal risk-filter)"}
 RISK_LOG_FILE = Path(__file__).with_name("risk_log.jsonl")
 TOKYO = ZoneInfo("Asia/Tokyo")
 
+# 想定フィールド（Forex Factory）。スキーマ崩れ検知の基準にする。
+FF_EXPECTED_FIELDS = ("country", "impact", "date", "title")
+
 # 「リスク不明」を表す共通フォールバック（あらゆる失敗時に返す）
 UNKNOWN_RISK = {
     "enabled": True,
     "available": False,
+    "status": "unknown",
     "risk_level": "unknown",
     "advise_caution": False,
     "headline": "",
@@ -88,14 +116,40 @@ UNKNOWN_RISK = {
 }
 
 
+def _result(status: str, **extra) -> dict:
+    """status 付きの結果 dict を組み立てる。available は status=="ok" のみ True。"""
+    r = {**UNKNOWN_RISK, "status": status, "available": status == "ok", "upcoming_events": []}
+    r.update(extra)
+    return r
+
+
 # ─────────────────────────────────────────────────────────────
 # カレンダー取得・パース（すべて決定論的）
 # ─────────────────────────────────────────────────────────────
 def _parse_ff(data) -> list[dict]:
-    """Forex Factory 週次JSONをパースし、USD/JPY の High イベントを返す。"""
-    events: list[dict] = []
+    """Forex Factory 週次JSONをパースし、全通貨の High イベントを返す。
+
+    スキーマ崩れ（フィールド名変更など）は CalendarSchemaError で通知する。
+    「スキーマは正常だが今週は High が0件」は正常（空リストを返す）として扱い、
+    両者を混同しない。
+    """
     if not isinstance(data, list):
-        return events
+        raise CalendarSchemaError("FFフィードが配列ではありません")
+
+    # 非空ペイロードなのに想定フィールドが揃っていない → スキーマ未認識。
+    # 「どれか1つ」ではなく「各フィールドが先頭数件のどこかに存在する」ことを要求する。
+    # こうしないと impact/date だけ改名された場合に全件スキップされ、偽の0件になる。
+    if data:
+        head = [it for it in data[:5] if isinstance(it, dict)]
+        if not head or not all(
+            any(field in it for it in head) for field in FF_EXPECTED_FIELDS
+        ):
+            missing = [f for f in FF_EXPECTED_FIELDS if not any(f in it for it in head)]
+            raise CalendarSchemaError(
+                f"FFフィードに想定フィールドが不足: {missing}"
+            )
+
+    events: list[dict] = []
     for item in data:
         try:
             currency = str(item.get("country", "")).upper()
@@ -182,23 +236,40 @@ def _fetch_calendar(currencies: tuple[str, ...]) -> list[dict]:
     - type="all" のソース（FF）は1リクエストで全通貨を返すのでそのまま採用。
     - type="per_currency" のソース（jblanked）は、対象 currencies ごとに URL を組んで
       取得し集約する（複数ペアでも対象通貨を取りこぼさない）。
-    すべて失敗したら RuntimeError を送出（呼び出し側で握りつぶす）。
+
+    失敗種別を区別して送出する（呼び出し側で status に反映）:
+    - 到達はできたが構造を認識できない → CalendarSchemaError
+    - すべて到達不能/通信失敗            → CalendarUnavailable
+    どのソースも成功しなかったとき、スキーマ崩れが観測されていればそれを優先して
+    送出する（「到達はしている」ことが分かるため）。
     """
-    last_error: Exception | None = None
+    net_error: Exception | None = None
+    schema_error: CalendarSchemaError | None = None
+
     for src in CALENDAR_SOURCES:
+        parser = _PARSERS[src["parser"]]
+        # 1) 取得（通信）— 失敗は net_error として次ソースへ
         try:
-            parser = _PARSERS[src["parser"]]
             if src.get("type") == "per_currency":
-                agg: list[dict] = []
-                for cur in currencies:
-                    agg.extend(parser(_fetch_one(src["url"].format(cur=cur))))
-                return agg  # 到達できた（0件＝休場週でも採用）
-            # type="all": 全通貨を一括取得
-            return parser(_fetch_one(src["url"]))
-        except Exception as exc:  # noqa: BLE001 - 1ソースの失敗で全体は止めない
-            last_error = exc
+                payloads = [_fetch_one(src["url"].format(cur=cur)) for cur in currencies]
+            else:
+                payloads = [_fetch_one(src["url"])]
+        except Exception as exc:  # noqa: BLE001 - 通信失敗
+            net_error = exc
             continue
-    raise RuntimeError(f"全カレンダーソースが利用不可: {last_error}")
+        # 2) パース（構造）— スキーマ崩れは schema_error として次ソースへ
+        try:
+            events: list[dict] = []
+            for payload in payloads:
+                events.extend(parser(payload))
+            return events  # 到達＆認識OK（0件＝休場週でも正常採用）
+        except CalendarSchemaError as exc:
+            schema_error = exc
+            continue
+
+    if schema_error is not None:
+        raise schema_error
+    raise CalendarUnavailable(f"全カレンダーソースが利用不可: {net_error}")
 
 
 def _relevant_events(
@@ -270,15 +341,21 @@ def _extract_json(text: str) -> dict | None:
     return None
 
 
-def _call_llm(payload: dict) -> dict | None:
-    """Claude API を呼び、構造化リスク評価JSONを返す。失敗で None。"""
+def _call_llm(payload: dict) -> tuple[str, dict | None]:
+    """Claude API を呼び (call_status, raw_json) を返す。
+
+    call_status:
+        "no_api_key" … APIキー未設定 / anthropic SDK 未導入（意図的にオフ相当）
+        "llm_failed" … 呼び出しが例外 / 応答テキストなし
+        "got_text"   … 応答テキストを取得（raw_json は抽出結果。失敗時 None）
+    """
     api_key = os.environ.get(API_KEY_ENV)
     if not api_key:
-        return None
+        return ("no_api_key", None)
     try:
         import anthropic  # 遅延 import（未インストールでも本体を壊さない）
     except ImportError:
-        return None
+        return ("no_api_key", None)
 
     try:
         client = anthropic.Anthropic(
@@ -298,9 +375,12 @@ def _call_llm(payload: dict) -> dict | None:
         text = "{" + "".join(
             b.text for b in resp.content if getattr(b, "type", None) == "text"
         )
-        return _extract_json(text)
     except Exception:
-        return None
+        return ("llm_failed", None)
+
+    if not text or text == "{":
+        return ("llm_failed", None)
+    return ("got_text", _extract_json(text))
 
 
 def _coerce_bool(value) -> bool:
@@ -327,6 +407,7 @@ def _normalize_llm_output(raw: dict | None) -> dict | None:
     return {
         "enabled": True,
         "available": True,
+        "status": "ok",
         "risk_level": level,
         # 文字列 "false" を True と誤判定しないよう頑健に変換
         "advise_caution": _coerce_bool(raw.get("advise_caution", False)),
@@ -364,29 +445,45 @@ def assess_risk(
         pair_label: 通貨ペア表示名（例 'AUD/JPY'）。LLM入力に渡す。
 
     Returns:
-        常に dict を返し、例外は決して送出しない。失敗時は UNKNOWN_RISK 相当。
-        キー: enabled, available, risk_level(high/medium/low/unknown),
+        常に dict を返し、例外は決して送出しない。失敗時も status 付きで返す。
+        キー: enabled, available, status, risk_level(high/medium/low/unknown),
               advise_caution, headline, reason, events, upcoming_events
     """
     if not RISK_FILTER_ENABLED:
-        return {**UNKNOWN_RISK, "enabled": False, "upcoming_events": []}
+        return _result("disabled", enabled=False)
 
-    result = {**UNKNOWN_RISK, "upcoming_events": []}
     now_utc = datetime.now(timezone.utc)
     target_currencies = tuple(currencies) if currencies else CURRENCIES
+    pair = pair_label or "/".join(target_currencies)
 
-    # 1) カレンダー取得＋時間計算（決定論的）。失敗は握りつぶし「リスク不明」で続行。
+    # 1) カレンダー取得＋時間計算（決定論的）。失敗種別を status に反映。
     try:
         all_events = _fetch_calendar(target_currencies)
+    except CalendarSchemaError as exc:
+        print(f"[{pair}] カレンダーのスキーマを認識できません: {exc}", file=sys.stderr)
+        return _result("calendar_schema")
     except Exception:
-        return result  # カレンダー到達不可 → リスク不明（本体は通常通り）
+        return _result("calendar_unavailable")
 
     upcoming = _relevant_events(all_events, now_utc, target_currencies)
-    result["upcoming_events"] = upcoming
+
+    def _make_log(status, output_raw, output_normalized, payload, **extra):
+        _log(
+            {
+                "timestamp": now_utc.astimezone(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
+                "pair": pair,
+                "status": status,
+                "model": LLM_MODEL,
+                "input": payload,
+                "output_raw": output_raw,
+                "output_normalized": output_normalized,
+                **extra,
+            }
+        )
 
     # 2) LLM へ渡す構造化入力を組み立て（日時計算は上で済ませてある）
     payload = {
-        "pair": pair_label or "/".join(target_currencies),
+        "pair": pair,
         "signal": {
             "state": signal_info.get("state"),
             "price": signal_info.get("price"),
@@ -398,23 +495,33 @@ def assess_risk(
         "events": upcoming,
     }
 
-    # 3) LLM 呼び出し（テキスト解釈のみ）。失敗・不正は「リスク不明」フォールバック。
-    raw = _call_llm(payload)
-    normalized = _normalize_llm_output(raw)
+    # 改善5（任意）: イベント0件かつ値動きが穏やかなら、LLMを呼ばず決定論的に low。
+    if RISK_SKIP_LLM_WHEN_QUIET and not upcoming:
+        ch = signal_info.get("change_1h_pct")
+        if ch is None or abs(ch) < RISK_QUIET_PCT:
+            res = _result(
+                "ok",
+                risk_level="low",
+                reason="重要イベントなし・値動き穏やか（LLMスキップ）",
+                upcoming_events=upcoming,
+            )
+            _make_log("ok", None, res, payload, llm_skipped=True)
+            return res
 
-    # 4) 監査ログ（入力・出力・タイムスタンプ）を追記。リプレイ不可なLLMの評価記録。
-    _log(
-        {
-            "timestamp": now_utc.astimezone(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
-            "pair": payload["pair"],
-            "model": LLM_MODEL,
-            "input": payload,
-            "output_raw": raw,
-            "output_normalized": normalized,
-        }
-    )
+    # 3) LLM 呼び出し（テキスト解釈のみ）。call_status で失敗種別を区別する。
+    call_status, raw = _call_llm(payload)
+    if call_status == "no_api_key":
+        status, normalized = "no_api_key", None
+    elif call_status == "llm_failed":
+        status, normalized = "llm_failed", None
+    else:  # got_text
+        normalized = _normalize_llm_output(raw)
+        status = "ok" if normalized is not None else "parse_failed"
 
-    if normalized is None:
-        return result  # LLM未実行/失敗/パース不可 → リスク不明
-    normalized["upcoming_events"] = upcoming
-    return normalized
+    # 4) 監査ログ（入力・出力・タイムスタンプ・status）を追記。
+    _make_log(status, raw, normalized, payload)
+
+    if status == "ok":
+        normalized["upcoming_events"] = upcoming
+        return normalized
+    return _result(status, upcoming_events=upcoming)

@@ -1,4 +1,8 @@
-yfinance
-pandas
-requests
-anthropic
+# バージョン固定: 自動の最新追従はせず、定期的に「意図して」上げる方針。
+# 範囲は「動作確認済みの下限 〜 次のメジャー未満」。更新時は fx_signal.py と
+# backtest.py が動くことを確認してから引き上げる。
+# （最終確認: 2026-05 / yfinance 1.4.1, pandas 3.0.3, requests 2.34.2, anthropic 0.105.2）
+yfinance>=1.4,<2
+pandas>=2.2,<4
+requests>=2.32,<3
+anthropic>=0.105,<1

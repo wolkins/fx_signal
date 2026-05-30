@@ -137,12 +137,30 @@ python backtest.py USDJPY=X 60d 5m  # 単一ペアを転換履歴つきで詳細
 - カレンダー到達失敗 / タイムアウト / JSON不正 / LLM失敗 / パース失敗 / `ANTHROPIC_API_KEY` 未設定 —
   いずれの場合も「リスク不明」として**通常どおりシグナル通知を出します**。本体は落ちません。
 
+### 失敗の可視化（status とフッター）
+リスク層の失敗を「警告なし(low)」と取り違えないよう、`assess_risk` は `status` を返します。
+
+| status | 意味 | 末尾フッター |
+|--------|------|:---:|
+| `ok` | LLMが評価し正規化成功 | 出さない |
+| `disabled` | `RISK_FILTER_ENABLED=False` | 出さない |
+| `no_api_key` | APIキー未設定 / SDK未導入（意図的オフ） | 出さない |
+| `calendar_unavailable` | 全カレンダーソースが取得失敗 | **出す** |
+| `calendar_schema` | 取得は成功したが構造を認識できない | **出す** |
+| `llm_failed` | LLM呼び出しが例外/応答なし | **出す** |
+| `parse_failed` | LLM応答はあったがJSON正規化に失敗 | **出す** |
+
+「設定上は動くはずなのに失敗した」4種だけ、通知の**末尾**に控えめな1行を付けます
+（`ℹ️ リスク評価は取得できませんでした（本体シグナルは通常どおり）`）。`high` 用の先頭 ⚠️ ブロックとは別物です。
+なお「フィードは正常だが今週は High イベントが0件」は**正常(low扱い)**で、`calendar_schema` とは区別します。
+
 ### 設定（`risk_filter.py` 冒頭の定数）
 | 定数 | 既定 | 説明 |
 |------|------|------|
 | `RISK_FILTER_ENABLED` | `True` | `False` でリスク層を丸ごと無効化 |
 | `RISK_SUPPRESS_SIGNALS` | `False` | `True` かつ `risk_level=high` の時だけシグナルを「情報のみ」に格下げ |
 | `RISK_LOOKAHEAD_HOURS` | `6` | 何時間先までのイベントを警戒対象にするか |
+| `RISK_SKIP_LLM_WHEN_QUIET` | `False` | `True` でイベント0件かつ値動き穏やか時はLLMを呼ばず決定論的に low（監査ログは残す） |
 | `LLM_MODEL` | `claude-haiku-4-5` | 最安・最速ティア |
 | `LLM_TEMPERATURE` | `0.0` | 決定性重視 |
 

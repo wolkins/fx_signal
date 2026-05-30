@@ -62,6 +62,9 @@ jobs:
             echo "差分なし — commit をスキップします。"
           else
             git commit -m "chore: update state [skip ci]"
+            # 直列実行でも稀に他の実行が先にpushして弾かれる(non-fast-forward)ことが
+            # あるため、push前に rebase で取り込む。--autostash で未コミット差分も退避。
+            git pull --rebase --autostash origin main || true
             git push
           fi
         env:

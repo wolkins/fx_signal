@@ -266,7 +266,11 @@ def notify(text: str) -> None:
         resp = requests.post(url, json={"text": text}, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        print(f"Slack通知に失敗: {exc}\n本文:\n{text}", file=sys.stderr)
+        # exc 文字列には Webhook URL が含まれることがあるため出さない（機密漏洩防止）。
+        # 漏れて困らない「種別 / ステータスコード」だけをログに出す。
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        detail = f"HTTP {status}" if status else type(exc).__name__
+        print(f"Slack通知に失敗: {detail}（URLは伏せています）\n本文:\n{text}", file=sys.stderr)
 
 
 def _risk_prefix(risk: dict | None) -> str:
@@ -289,6 +293,29 @@ def _risk_prefix(risk: dict | None) -> str:
         lines.append(reason)
     lines.append(f"（リスク: {risk.get('risk_level', 'unknown')}）")
     return "\n".join(lines) + "\n———\n"
+
+
+# 「設定上は動くはずなのに失敗した」status。末尾フッターで可視化する。
+_RISK_FAILED_STATUSES = (
+    "calendar_unavailable",
+    "calendar_schema",
+    "llm_failed",
+    "parse_failed",
+)
+
+
+def _risk_footer(risk: dict | None) -> str:
+    """リスク層が想定外に失敗した時だけ、本体通知の末尾に控えめな1行を付ける。
+
+    付ける: calendar_unavailable / calendar_schema / llm_failed / parse_failed
+    付けない: ok / disabled / no_api_key（正常・意図的オフはノイズにしない）。
+    high リスク用の先頭⚠️ブロック(_risk_prefix)とは別物。
+    """
+    if not risk:
+        return ""
+    if risk.get("status") in _RISK_FAILED_STATUSES:
+        return "\nℹ️ リスク評価は取得できませんでした（本体シグナルは通常どおり）"
+    return ""
 
 
 def format_message(
@@ -321,7 +348,7 @@ def format_message(
         f"RSI{RSI_PERIOD}: {rsi_str}\n"
         f"最新足: {info['time']}（{INTERVAL}）"
     )
-    return _risk_prefix(risk) + body
+    return _risk_prefix(risk) + body + _risk_footer(risk)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -371,13 +398,18 @@ def process_pair(ticker: str) -> None:
             suppress = risk_filter.RISK_SUPPRESS_SIGNALS
         except Exception as exc:  # noqa: BLE001 - 付加層の失敗で本体を止めない
             print(f"[{label}] リスク層でエラー（リスク不明で続行）: {exc}", file=sys.stderr)
-            risk = None
+            # モジュール不備等でassess_riskに到達できなくても、末尾フッターで可視化する
+            risk = {"status": "llm_failed", "risk_level": "unknown", "available": False}
 
         info_only = bool(risk and suppress and risk.get("risk_level") == "high")
         notify(format_message(info, label=label, decimals=decimals, risk=risk, info_only=info_only))
         save_state(path, info)
-        risk_level = risk.get("risk_level") if risk else "unknown"
-        print(f"[{label}] 状態変化: {prev.get('state')} → {info['state']} / リスク: {risk_level}")
+        rlevel = risk.get("risk_level") if risk else "unknown"
+        rstatus = risk.get("status") if risk else "unknown"
+        print(
+            f"[{label}] 状態変化: {prev.get('state')} → {info['state']}"
+            f" / リスク: {rlevel} (status={rstatus})"
+        )
     else:
         # 同じ状態が続く間は通知しない（チャタリング防止）
         print(f"[{label}] 状態変化なし: {info['state']}（通知スキップ）")
