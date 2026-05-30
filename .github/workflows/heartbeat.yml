@@ -1,0 +1,38 @@
+name: heartbeat
+
+# 週次ハートビート（改善B）。「監視が生きている」ことを Slack に1回送る。
+# サイレント故障（ワークフローが止まっている等）に気づくための死活確認。
+on:
+  schedule:
+    # 毎週月曜 23:00 UTC（＝火曜 08:00 JST、取引時間中）に1回
+    - cron: "0 23 * * 1"
+  workflow_dispatch: {}
+
+# 通知するだけなので書き込み権限は不要。
+permissions:
+  contents: read
+
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest   # 無料枠を10倍消費する macOS は使わない
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send heartbeat
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python fx_signal.py --heartbeat

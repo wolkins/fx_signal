@@ -356,8 +356,11 @@ def format_message(
 # ─────────────────────────────────────────────────────────────
 # メイン
 # ─────────────────────────────────────────────────────────────
-def process_pair(ticker: str) -> None:
-    """1通貨ペアを判定し、状態変化時のみ通知する。
+def process_pair(ticker: str) -> str:
+    """1通貨ペアを判定し、状態変化時のみ通知する。結果の種別を返す。
+
+    返り値: "fetch_failed"（取得そのものが空＝障害の可能性）/ "no_data"（データは
+    あるが市場クローズ/本数不足）/ "first_run" / "changed" / "nochange"。
 
     ペアごとに独立した state_<PAIR>.json で状態を管理する。
     1ペアの処理が例外を投げても、呼び出し側で他ペアは止めない。
@@ -371,19 +374,26 @@ def process_pair(ticker: str) -> None:
     prev_state = prev.get("state") if prev else None
 
     df = fetch_data(ticker)
+
+    # 取得そのものが空＝データ源の障害候補（市場クローズ中は古い足が返るので空には
+    # ならず、後段の evaluate が None を返す＝"no_data" として区別される）。
+    if df is None or df.empty:
+        print(f"[{label}] データ取得に失敗（空の応答）。")
+        return "fetch_failed"
+
     info = evaluate(df, prev_state=prev_state)
 
     if info is None:
-        # データが空 or 本数不足（市場クローズ中など）はクラッシュさせず正常終了
+        # データはあるが本数不足/最新足が古い（市場クローズ中など）。正常スキップ。
         print(f"[{label}] データ不足のため判定をスキップ（市場クローズ中など）。")
-        return
+        return "no_data"
 
     if prev is None:
         # 初回起動: 監視開始を1回だけ通知して状態を保存
         notify(format_message(info, label=label, decimals=decimals, first_run=True))
         save_state(path, info)
         print(f"[{label}] 初回起動: 状態を {info['state']} で保存しました。")
-        return
+        return "first_run"
 
     if prev.get("state") != info["state"]:
         # 状態が変わった瞬間だけ通知。
@@ -412,20 +422,129 @@ def process_pair(ticker: str) -> None:
             f"[{label}] 状態変化: {prev.get('state')} → {info['state']}"
             f" / リスク: {rlevel} (status={rstatus})"
         )
+        return "changed"
     else:
         # 同じ状態が続く間は通知しない（チャタリング防止）
         print(f"[{label}] 状態変化なし: {info['state']}（通知スキップ）")
+        return "nochange"
+
+
+# ─────────────────────────────────────────────────────────────
+# データ源のサイレント故障検知（改善A）
+# ─────────────────────────────────────────────────────────────
+HEALTH_FILE = Path(__file__).with_name("data_health.json")
+DATA_ALERT_STREAK = 2  # 連続この回数だけ「全ペア取得失敗」したら警告（単発ブレを無視）
+
+
+def _load_health() -> dict:
+    try:
+        return json.loads(HEALTH_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"fail_streak": 0, "alerted": False}
+
+
+def _save_health(h: dict) -> None:
+    HEALTH_FILE.write_text(
+        json.dumps(h, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def update_data_health(all_failed: bool, data_ok: bool) -> None:
+    """全ペアでデータ取得に失敗し続けたら1回だけ警告し、回復したら通知する。
+
+    市場クローズ中（data も all_failed もFalse＝"no_data"のみ）は健全性を変更しない。
+    """
+    h = _load_health()
+    if all_failed:
+        h["fail_streak"] = h.get("fail_streak", 0) + 1
+        if h["fail_streak"] >= DATA_ALERT_STREAK and not h.get("alerted"):
+            notify(
+                "🔌 データ取得に失敗しています（yfinance障害の可能性）。\n"
+                "本体監視は継続しますが、取引時間中であれば確認してください。"
+            )
+            h["alerted"] = True
+        _save_health(h)
+    elif data_ok:
+        # 実際にデータが流れた＝回復。アラート中だった場合のみ回復通知。
+        if h.get("alerted"):
+            notify("✅ データ取得が回復しました（監視は通常どおり継続中）。")
+        if h.get("fail_streak") or h.get("alerted"):
+            _save_health({"fail_streak": 0, "alerted": False})
+    # それ以外（market closed等）は健全性ファイルを変更しない
+
+
+def _latest_age_min(df: pd.DataFrame) -> float | None:
+    """最新足が何分前かを返す。取得できなければ None。"""
+    if df is None or df.empty or "Close" not in df.columns:
+        return None
+    close = df["Close"].dropna()
+    if close.empty:
+        return None
+    ts = close.index[-1]
+    if not isinstance(ts, pd.Timestamp):
+        return None
+    ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    return (datetime.now(TOKYO) - ts.tz_convert(TOKYO)).total_seconds() / 60.0
+
+
+def heartbeat() -> int:
+    """週次ハートビート: 「稼働中」＋各ペアの現在状態＋データ鮮度を1回通知する（改善B）。
+
+    実行時刻（cronで火曜08:00 JSTなど確実に市場オープン中）に**全ペアの最新足が古い**
+    なら「データ源が固まっている可能性」を添える。これは process_pair 側では市場クローズと
+    区別できない『古いまま固まる』故障（改善Aの空取得では拾えない）への週次バックストップ。
+    取得失敗してもハートビート自体は送る（死活確認を優先）。
+    """
+    lines = ["✅ FXシグナル監視は稼働中です（週次ハートビート）"]
+    ages: list[float | None] = []
+    for ticker in PAIRS:
+        label = pair_label(ticker)
+        st = load_state(state_path(ticker))
+        if st:
+            stance = "買い📈" if st.get("state") == "LONG" else "売り📉"
+            lines.append(
+                f"・{label}: 現在 {st.get('state')}（{stance}） / {st.get('updated_at', '?')} 時点"
+            )
+        else:
+            lines.append(f"・{label}: 状態未確定（次のオープンで初期化されます）")
+        try:
+            ages.append(_latest_age_min(fetch_data(ticker)))
+        except Exception:  # noqa: BLE001 - 鮮度チェックの失敗で死活通知は止めない
+            ages.append(None)
+
+    # この時刻は市場オープン中の想定。全ペアでデータがある（None でない）のに
+    # すべて古い場合のみ「固まり」を疑う（市場クローズの祝日等は誤検知しにくい時刻設定）。
+    known = [a for a in ages if a is not None]
+    if known and all(a > STALE_MINUTES for a in known):
+        lines.append(
+            "⚠️ ただし全ペアで最新足が古いです。データ源が止まっている可能性があります。"
+        )
+    notify("\n".join(lines))
+    print("ハートビートを送信しました。")
+    return 0
 
 
 def main() -> int:
     # 各ペアを独立処理。1ペアの失敗が他ペアの監視を止めないようにする。
+    outcomes: list[str] = []
     for ticker in PAIRS:
         try:
-            process_pair(ticker)
+            outcomes.append(process_pair(ticker))
         except Exception as exc:  # noqa: BLE001 - 1ペアの失敗で全体を止めない
             print(f"[{pair_label(ticker)}] 処理中にエラー（スキップ）: {exc}", file=sys.stderr)
+            outcomes.append("error")
+
+    # 全ペアが「空の取得失敗」の時だけデータ障害とみなす（市場クローズは"no_data"で除外）。
+    all_failed = bool(outcomes) and all(o == "fetch_failed" for o in outcomes)
+    data_ok = any(o in ("first_run", "changed", "nochange") for o in outcomes)
+    try:
+        update_data_health(all_failed, data_ok)
+    except Exception as exc:  # noqa: BLE001 - 健全性チェックの失敗で本体を止めない
+        print(f"データ健全性チェックでエラー: {exc}", file=sys.stderr)
     return 0
 
 
 if __name__ == "__main__":
+    if "--heartbeat" in sys.argv:
+        sys.exit(heartbeat())
     sys.exit(main())

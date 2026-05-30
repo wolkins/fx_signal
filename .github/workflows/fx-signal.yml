@@ -49,8 +49,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # ペアごとの状態ファイル（state_USDJPY.json 等）をまとめて対象にする
+          # ペアごとの状態ファイル（state_USDJPY.json 等）とデータ健全性ファイルを対象に
           git add -A state_*.json 2>/dev/null || true
+          git add -A data_health.json 2>/dev/null || true
           # 監査ログ(risk_log.jsonl)も commit 対象にするかは下のフラグで選べる。
           # パブリックリポジトリなのでログに機密を入れないこと（入力イベント名と
           # 出力JSONのみ。APIキーや個人情報は記録しない設計）。

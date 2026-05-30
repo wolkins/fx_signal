@@ -83,7 +83,13 @@ CALENDAR_SOURCES = (
     {
         "name": "forexfactory",
         "type": "all",
-        "url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        # 今週＋来週を束ねて週境界の取りこぼしを防ぐ。来週分(nextweek)は現状この
+        # 無料プロバイダだと404のことがあるが、その場合は無害にスキップし今週分だけ
+        # 採用する（将来提供されれば自動で取り込む）。
+        "urls": [
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        ],
         "parser": "ff",
     },
     {
@@ -248,24 +254,41 @@ def _fetch_calendar(currencies: tuple[str, ...]) -> list[dict]:
 
     for src in CALENDAR_SOURCES:
         parser = _PARSERS[src["parser"]]
-        # 1) 取得（通信）— 失敗は net_error として次ソースへ
+
+        if src.get("type") == "per_currency":
+            # 通貨ごとにベストエフォート集約（鍵必須のjblanked用フォールバック）。
+            events: list[dict] = []
+            got = False
+            for cur in currencies:
+                try:
+                    events.extend(parser(_fetch_one(src["url"].format(cur=cur))))
+                    got = True
+                except Exception as exc:  # noqa: BLE001
+                    net_error = exc
+            if got:
+                return events
+            continue
+
+        # type="all": 先頭=主フィード（スキーマを厳格チェック）/ 残り=任意フィード。
+        urls = list(src.get("urls") or [src["url"]])
         try:
-            if src.get("type") == "per_currency":
-                payloads = [_fetch_one(src["url"].format(cur=cur)) for cur in currencies]
-            else:
-                payloads = [_fetch_one(src["url"])]
-        except Exception as exc:  # noqa: BLE001 - 通信失敗
+            payload = _fetch_one(urls[0])  # 主フィードの通信失敗 → 次ソースへ
+        except Exception as exc:  # noqa: BLE001
             net_error = exc
             continue
-        # 2) パース（構造）— スキーマ崩れは schema_error として次ソースへ
         try:
-            events: list[dict] = []
-            for payload in payloads:
-                events.extend(parser(payload))
-            return events  # 到達＆認識OK（0件＝休場週でも正常採用）
+            events = parser(payload)  # 主フィードのスキーマ崩れは握りつぶさず可視化する
         except CalendarSchemaError as exc:
             schema_error = exc
             continue
+        # 主フィードOK → 任意フィード（来週分など）はベストエフォートで追加。
+        # 取れなければ無視する（404でも200スキーマ崩れでも本流の判定に影響させない）。
+        for url in urls[1:]:
+            try:
+                events.extend(parser(_fetch_one(url)))
+            except Exception:  # noqa: BLE001
+                pass
+        return events  # 到達＆認識OK（0件＝休場週でも正常採用）
 
     if schema_error is not None:
         raise schema_error

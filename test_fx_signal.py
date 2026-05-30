@@ -31,8 +31,9 @@ import backtest as bt
 import fx_signal as fx
 import risk_filter as rf
 
-# テストは作業ツリーの risk_log.jsonl を汚さない（監査ログを一時パスへ退避）。
+# テストは作業ツリーを汚さない（監査ログ・健全性ファイルを一時パスへ退避）。
 rf.RISK_LOG_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_risk_log.jsonl"
+fx.HEALTH_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_health.json"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -253,6 +254,108 @@ def test_notify_does_not_leak_url():
     err = buf.getvalue()
     assert "SECRET123" not in err and "hooks.slack.com" not in err
     assert "HTTP 404" in err  # ステータスコードは出る
+
+
+# ─────────────────────────────────────────────────────────────
+# 改善C: カレンダー複数フィードの部分成功（thisweek成功＋nextweek404）
+# ─────────────────────────────────────────────────────────────
+def test_calendar_multifeed_partial_success():
+    import requests
+
+    def fake_one(url):
+        if "thisweek" in url:
+            return [
+                {"country": "USD", "impact": "High",
+                 "date": "2026-05-28T12:30:00+00:00", "title": "CPI"}
+            ]
+        if "nextweek" in url:
+            raise requests.HTTPError("404")  # 来週分は未提供
+        raise requests.HTTPError("401")  # jblanked
+
+    with patched(rf, _fetch_one=fake_one):
+        evs = rf._fetch_calendar(("USD", "JPY"))
+    assert [e["title"] for e in evs] == ["CPI"]  # 404でも今週分を採用
+
+
+def test_calendar_all_feeds_fail_raises():
+    import requests
+
+    def boom(url):
+        raise requests.HTTPError("down")
+
+    with patched(rf, _fetch_one=boom):
+        try:
+            rf._fetch_calendar(("USD", "JPY"))
+            raise AssertionError("全滅で例外が出なかった")
+        except rf.CalendarUnavailable:
+            pass
+
+
+def test_calendar_primary_schema_error_surfaces():
+    # 主フィード(thisweek)のスキーマ崩れは握りつぶさず calendar_schema として表に出す。
+    import requests
+
+    def fake_one(url):
+        if "thisweek" in url:
+            return [{"ccy": "USD", "strength": "High"}]  # 想定フィールド無し
+        raise requests.HTTPError("404")  # nextweek / jblanked
+
+    with patched(rf, _fetch_one=fake_one):
+        try:
+            rf._fetch_calendar(("USD", "JPY"))
+            raise AssertionError("主フィードのスキーマ崩れで例外が出なかった")
+        except rf.CalendarSchemaError:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────
+# 改善A: データ源サイレント故障の検知（警告→回復、市場クローズは中立）
+# ─────────────────────────────────────────────────────────────
+def test_data_health_alert_recovery_and_neutral():
+    fx.HEALTH_FILE.unlink(missing_ok=True)
+    sent: list[str] = []
+    with patched(fx, notify=sent.append):
+        fx.update_data_health(True, False)   # streak1: 閾値未満→無音
+        assert not sent
+        fx.update_data_health(True, False)   # streak2: 警告
+        assert sent and "データ取得に失敗" in sent[-1]
+        n = len(sent)
+        fx.update_data_health(True, False)   # 既に警告済→無音
+        assert len(sent) == n
+        fx.update_data_health(False, False)  # 市場クローズ(no_data)→中立・無音
+        assert len(sent) == n
+        fx.update_data_health(False, True)   # データ回復→回復通知
+        assert "回復" in sent[-1]
+    fx.HEALTH_FILE.unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# 改善B: 週次ハートビート
+# ─────────────────────────────────────────────────────────────
+def test_heartbeat_message():
+    sent: list[str] = []
+    with patched(fx, PAIRS=["USDJPY=X"],
+                 load_state=lambda p: {"state": "LONG", "updated_at": "2026-05-30 08:00 JST"},
+                 fetch_data=lambda t: None,  # 鮮度チェックはスキップ（取得しない）
+                 notify=sent.append):
+        fx.heartbeat()
+    assert sent and "稼働中" in sent[0] and "USD/JPY" in sent[0] and "LONG" in sent[0]
+    assert "古い" not in sent[0]  # データ無し（None）なら鮮度警告は出さない
+
+
+def test_heartbeat_stale_feed_warns():
+    import pandas as pd
+    sent: list[str] = []
+    # 最新足が STALE_MINUTES より十分古い df を返す
+    old = pd.date_range(end=pd.Timestamp("2026-05-26 00:00", tz="UTC"), periods=3, freq="5min")
+    stale_df = pd.DataFrame({"Close": [1.0, 2.0, 3.0]}, index=old)
+    with patched(fx, PAIRS=["USDJPY=X"],
+                 load_state=lambda p: {"state": "LONG", "updated_at": "x"},
+                 fetch_data=lambda t: stale_df,
+                 STALE_MINUTES=90,
+                 notify=sent.append):
+        fx.heartbeat()
+    assert "古い" in sent[0]  # 全ペア古い → 固まり疑いの警告
 
 
 # ─────────────────────────────────────────────────────────────
