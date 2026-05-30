@@ -318,7 +318,7 @@ def test_data_health_alert_recovery_and_neutral():
         fx.update_data_health(True, False)   # streak1: 閾値未満→無音
         assert not sent
         fx.update_data_health(True, False)   # streak2: 警告
-        assert sent and "データ取得に失敗" in sent[-1]
+        assert sent and "失敗" in sent[-1]
         n = len(sent)
         fx.update_data_health(True, False)   # 既に警告済→無音
         assert len(sent) == n
@@ -326,6 +326,23 @@ def test_data_health_alert_recovery_and_neutral():
         assert len(sent) == n
         fx.update_data_health(False, True)   # データ回復→回復通知
         assert "回復" in sent[-1]
+    fx.HEALTH_FILE.unlink(missing_ok=True)
+
+
+def test_data_health_counts_exceptions_as_failure():
+    # process_pair が例外を投げ続ける故障も「全滅」として警告対象にする。
+    fx.HEALTH_FILE.unlink(missing_ok=True)
+    sent: list[str] = []
+
+    def boom(ticker):
+        raise RuntimeError("boom")
+
+    with patched(fx, PAIRS=["USDJPY=X", "AUDJPY=X"], process_pair=boom,
+                 notify=sent.append):
+        fx.main()  # 1回目: streak1
+        assert not sent
+        fx.main()  # 2回目: 閾値到達で警告
+    assert sent and "失敗" in sent[-1]
     fx.HEALTH_FILE.unlink(missing_ok=True)
 
 

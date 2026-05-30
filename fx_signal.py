@@ -459,8 +459,9 @@ def update_data_health(all_failed: bool, data_ok: bool) -> None:
         h["fail_streak"] = h.get("fail_streak", 0) + 1
         if h["fail_streak"] >= DATA_ALERT_STREAK and not h.get("alerted"):
             notify(
-                "🔌 データ取得に失敗しています（yfinance障害の可能性）。\n"
-                "本体監視は継続しますが、取引時間中であれば確認してください。"
+                "🔌 全ペアでデータ取得/処理に失敗しています"
+                "（yfinance障害やエラーの可能性）。\n"
+                "取引時間中であれば確認してください。"
             )
             h["alerted"] = True
         _save_health(h)
@@ -534,8 +535,10 @@ def main() -> int:
             print(f"[{pair_label(ticker)}] 処理中にエラー（スキップ）: {exc}", file=sys.stderr)
             outcomes.append("error")
 
-    # 全ペアが「空の取得失敗」の時だけデータ障害とみなす（市場クローズは"no_data"で除外）。
-    all_failed = bool(outcomes) and all(o == "fetch_failed" for o in outcomes)
+    # 全ペアが失敗（空取得 or 例外）の時だけデータ障害とみなす。
+    # 市場クローズは "no_data" なので除外され、誤検知しない。
+    # "error"（process_pairが例外）も含めることで、例外を投げ続ける故障も拾える。
+    all_failed = bool(outcomes) and all(o in ("fetch_failed", "error") for o in outcomes)
     data_ok = any(o in ("first_run", "changed", "nochange") for o in outcomes)
     try:
         update_data_health(all_failed, data_ok)
