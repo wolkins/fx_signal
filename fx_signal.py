@@ -20,6 +20,10 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+# 注: リスク層 risk_filter は「状態変化時」にのみ遅延 import する（main 内）。
+# トップレベルで import しないことで、万一リスク層側に不備があっても本体の
+# 起動・シグナル通知を絶対に妨げない（グレースフルデグレードの境界を明確化）。
+
 # ─────────────────────────────────────────────────────────────
 # 設定（ここを変えれば挙動を調整できる）
 # ─────────────────────────────────────────────────────────────
@@ -108,6 +112,20 @@ def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> float | None:
     return float(100.0 - (100.0 / (1.0 + rs)))
 
 
+def compute_change_pct(close: pd.Series, bars: int) -> float | None:
+    """直近 bars 本前からの価格変化率(%)を返す。算出不能なら None。
+
+    リスク層に渡す「介入リスク判断材料」としての決定論的な参考値。
+    """
+    if len(close) <= bars:
+        return None
+    old = close.iloc[-1 - bars]
+    new = close.iloc[-1]
+    if old == 0 or pd.isna(old) or pd.isna(new):
+        return None
+    return float((new - old) / old * 100.0)
+
+
 def evaluate(df: pd.DataFrame, prev_state: str | None = None) -> dict | None:
     """SMAクロスから状態を判定する。データ不足なら None。
 
@@ -166,6 +184,9 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None) -> dict | None:
         "short_ma": float(short_ma),
         "long_ma": float(long_ma),
         "rsi": compute_rsi(close),
+        # 直近の価格変化率（リスク層の介入リスク判断材料。決定論的に算出）
+        "change_15m_pct": compute_change_pct(close, 3),
+        "change_1h_pct": compute_change_pct(close, 12),
         "time": ts_str,
     }
 
@@ -215,14 +236,48 @@ def notify(text: str) -> None:
         print(f"Slack通知に失敗: {exc}\n本文:\n{text}", file=sys.stderr)
 
 
-def format_message(info: dict, *, first_run: bool = False) -> str:
+def _risk_prefix(risk: dict | None) -> str:
+    """リスク評価から、通知先頭に付ける警告ブロックを組み立てる。
+
+    risk_level=high もしくは advise_caution=True の時だけ警告行を付ける。
+    それ以外（low/medium/unknown/None）は空文字を返し、従来どおりの通知になる。
+    """
+    if not risk:
+        return ""
+    if risk.get("risk_level") != "high" and not risk.get("advise_caution"):
+        return ""
+
+    lines = [f"⚠️ {risk.get('headline') or 'リスク警戒'}"]
+    events = risk.get("events") or []
+    if events:
+        lines.append("警戒イベント: " + " / ".join(events[:3]))
+    reason = risk.get("reason")
+    if reason:
+        lines.append(reason)
+    lines.append(f"（リスク: {risk.get('risk_level', 'unknown')}）")
+    return "\n".join(lines) + "\n———\n"
+
+
+def format_message(
+    info: dict,
+    *,
+    first_run: bool = False,
+    risk: dict | None = None,
+    info_only: bool = False,
+) -> str:
     label = "買い目線 📈" if info["state"] == "LONG" else "売り目線 📉"
     rsi = info["rsi"]
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
 
-    header = "🔔 USD/JPY 監視を開始しました" if first_run else "⚡ USD/JPY シグナル変化"
+    if first_run:
+        header = "🔔 USD/JPY 監視を開始しました"
+    elif info_only:
+        # 高リスクのためシグナルを「情報のみ」に格下げ（発注は促さない）
+        header = "🛑 USD/JPY シグナル【情報のみ・発注見送り推奨】"
+    else:
+        header = "⚡ USD/JPY シグナル変化"
 
-    return (
+    body = (
         f"{header}\n"
         f"状態: *{info['state']}*（{label}）\n"
         f"価格: {info['price']:.3f}\n"
@@ -230,6 +285,7 @@ def format_message(info: dict, *, first_run: bool = False) -> str:
         f"RSI{RSI_PERIOD}: {rsi_str}\n"
         f"最新足: {info['time']}（{INTERVAL}）"
     )
+    return _risk_prefix(risk) + body
 
 
 # ─────────────────────────────────────────────────────────────
@@ -255,10 +311,25 @@ def main() -> int:
         return 0
 
     if prev.get("state") != info["state"]:
-        # 状態が変わった瞬間だけ通知
-        notify(format_message(info))
+        # 状態が変わった瞬間だけ通知。
+        # ここでのみリスク層を呼ぶ（＝LLM呼び出しは状態変化時に限定しコスト最小化）。
+        # リスク層が何を返しても/失敗しても、本体のシグナル通知は必ず出す。
+        # import 自体も try 内に置き、モジュール不備でも本体を止めない。
+        risk = None
+        suppress = False
+        try:
+            import risk_filter  # 遅延 import（付加層）
+            risk = risk_filter.assess_risk(info)
+            suppress = risk_filter.RISK_SUPPRESS_SIGNALS
+        except Exception as exc:  # noqa: BLE001 - 付加層の失敗で本体を止めない
+            print(f"リスク層でエラー（リスク不明として続行）: {exc}", file=sys.stderr)
+            risk = None
+
+        info_only = bool(risk and suppress and risk.get("risk_level") == "high")
+        notify(format_message(info, risk=risk, info_only=info_only))
         save_state(info)
-        print(f"状態変化: {prev.get('state')} → {info['state']}")
+        risk_level = risk.get("risk_level") if risk else "unknown"
+        print(f"状態変化: {prev.get('state')} → {info['state']} / リスク: {risk_level}")
     else:
         # 同じ状態が続く間は通知しない（チャタリング防止）
         print(f"状態変化なし: {info['state']}（通知スキップ）")

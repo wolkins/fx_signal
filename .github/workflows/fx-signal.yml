@@ -41,6 +41,8 @@ jobs:
       - name: Run signal monitor
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          # リスク層用。未設定でも本体は動く（リスク層だけスキップ）。
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python fx_signal.py
 
       - name: Commit state if changed
@@ -48,10 +50,19 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
+          # 監査ログ(risk_log.jsonl)も commit 対象にするかは下のフラグで選べる。
+          # パブリックリポジトリなのでログに機密を入れないこと（入力イベント名と
+          # 出力JSONのみ。APIキーや個人情報は記録しない設計）。
+          if [ "${COMMIT_RISK_LOG:-true}" = "true" ] && [ -f risk_log.jsonl ]; then
+            git add risk_log.jsonl
+          fi
           # 差分が無い時は commit しない
           if git diff --cached --quiet; then
-            echo "state.json に変化なし — commit をスキップします。"
+            echo "差分なし — commit をスキップします。"
           else
-            git commit -m "chore: update state.json [skip ci]"
+            git commit -m "chore: update state [skip ci]"
             git push
           fi
+        env:
+          # risk_log.jsonl を commit するなら "true"、しないなら "false"
+          COMMIT_RISK_LOG: "true"
