@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -54,6 +55,11 @@ STALE_MINUTES = 90
 TOKYO = ZoneInfo("Asia/Tokyo")
 WEBHOOK_ENV = "SLACK_WEBHOOK_URL"
 
+# データ取得のリトライ（VPS等データセンターIPは Yahoo に一時的に弾かれやすいため）。
+# 失敗/空応答のとき指数バックオフで再試行する。0 で無効。
+FETCH_RETRIES = 2
+FETCH_RETRY_BASE_SEC = 3
+
 
 # ─────────────────────────────────────────────────────────────
 # 通貨ペアのメタ情報をティッカーから導出
@@ -92,22 +98,32 @@ def state_path(ticker: str) -> Path:
 def fetch_data(ticker: str) -> pd.DataFrame:
     """yfinance から価格データを取得し、列を平坦化して返す。
 
-    通信失敗や yfinance 側のエラーで例外が出てもジョブを落とさず、空の
-    DataFrame を返して呼び出し側に「何もせず正常終了」させる。
+    通信失敗・空応答・レート制限(429)時は指数バックオフで数回リトライする。
+    最終的に失敗しても例外で落とさず、空の DataFrame を返して呼び出し側に
+    「何もせず正常終了」させる（グレースフルデグレード）。
     """
-    try:
-        df = yf.download(
-            ticker,
-            interval=INTERVAL,
-            period=PERIOD,
-            progress=False,
-            auto_adjust=True,
-        )
-    except Exception as exc:  # noqa: BLE001 - 取得失敗は握りつぶして正常終了させる
-        print(f"データ取得に失敗しました（スキップ）: {exc}", file=sys.stderr)
-        return pd.DataFrame()
+    df = None
+    last_exc: Exception | None = None
+    for attempt in range(FETCH_RETRIES + 1):
+        try:
+            df = yf.download(
+                ticker,
+                interval=INTERVAL,
+                period=PERIOD,
+                progress=False,
+                auto_adjust=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 取得失敗は握りつぶす
+            last_exc = exc
+            df = None
+        if df is not None and not df.empty:
+            break
+        if attempt < FETCH_RETRIES:
+            time.sleep(FETCH_RETRY_BASE_SEC * (attempt + 1))  # 3s, 6s, ...
 
     if df is None or df.empty:
+        if last_exc is not None:
+            print(f"データ取得に失敗しました（スキップ）: {last_exc}", file=sys.stderr)
         return pd.DataFrame()
 
     # 単一ティッカーでも列が MultiIndex になることがあるので平坦化する

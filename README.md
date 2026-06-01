@@ -153,6 +153,37 @@ python backtest.py --source dukascopy USDJPY=X 1y 5m   # 5分足で1年前まで
 
 ---
 
+## さくらVPS等で動かす（GitHub cron のスロットル回避）
+
+GitHub Actions の cron は混雑時に大幅遅延・間引きが起き、`*/5` でも実際は **15〜120分間隔**に
+なることがあります。**正確な5分間隔が必要なら、VPSの system cron で動かす**のが確実です。
+
+### セットアップ
+```bash
+git clone https://github.com/wolkins/fx_signal.git
+cd fx_signal
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp deploy/fx-signal.env.example fx-signal.env   # SLACK_WEBHOOK_URL / ANTHROPIC_API_KEY を記入
+crontab -e                                       # deploy/crontab.example を参考に登録
+```
+- `deploy/run.sh` が env を読み込み `python fx_signal.py` を実行するラッパーです。
+- **状態は `state_<PAIR>.json` にローカル保存**され、VPSでは Git commit 不要
+  （ファイルがそのまま永続化される）。`data_health.json` も同様。
+- データ取得は **429/失敗時に指数バックオフでリトライ**します（`FETCH_RETRIES`）。
+  VPSのデータセンターIPは Yahoo に弾かれやすいため。
+
+### ⚠️ 重要: GitHub の cron は止める（二重通知の防止）
+VPSとGitHub Actionsを**両方走らせると、別々の状態ファイルで二重に通知**します。VPSへ移すなら
+GitHub側の定期実行を止めてください（どちらか一方だけにする）:
+- `.github/workflows/fx-signal.yml` と `heartbeat.yml` の `schedule:` をコメントアウト、
+  または Actions 画面で各ワークフローを **Disable**。
+- `test.yml`（CI）はコードチェック用なので残してOK。
+
+> 注意: cron はサーバのTZで動きます（`timedatectl` で確認）。判定ロジックはコード内で
+> `Asia/Tokyo` 固定なのでサーバTZに依存しませんが、ハートビートの時刻指定はTZに注意。
+
+---
+
 ## リスクフィルター層（`risk_filter.py`）
 
 経済イベント・ニュースの「リスク警告」をシグナル通知に**添えるだけ**の付加層です。

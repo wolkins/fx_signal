@@ -1,0 +1,14 @@
+# さくらVPS等の system cron 設定例。`crontab -e` に貼って編集する。
+# パスは実際の clone 先に合わせて書き換えること（例 /home/ubuntu/fx_signal）。
+#
+# 注意: cron はサーバのタイムゾーンで動く。`timedatectl` で確認し、
+#       JST想定の時刻（ハートビート等）はサーバTZに合わせて調整する。
+#       （判定ロジック自体はコード内で Asia/Tokyo 固定なのでサーバTZに依存しない）
+
+# 本体監視: 5分おき。市場クローズ中は STALE_MINUTES ガードが自動スキップするので
+# 毎時実行で安全。GitHub と違いスロットルされず正確に動く。
+*/5 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
+
+# 週次ハートビート（死活確認）。下は「火曜08:00」をサーバTZがJSTの場合の例。
+# サーバがUTCなら "0 23 * * 1"（月23:00 UTC = 火08:00 JST）にする。
+0 8 * * 2 /home/USER/fx_signal/deploy/run.sh --heartbeat >> /home/USER/fx_signal/cron.log 2>&1
