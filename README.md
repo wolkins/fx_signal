@@ -15,7 +15,7 @@
 | 項目 | 内容 |
 |------|------|
 | データ取得 | [yfinance](https://pypi.org/project/yfinance/)（APIキー不要）。`PAIRS` の各ティッカー（例 `USDJPY=X`, `AUDJPY=X`）、5分足、`period="5d"` |
-| 判定 | 短期SMA(20) > 長期SMA(50) → `LONG` / 短期 < 長期 → `SHORT`（ペアごとに独立） |
+| 判定 | 短期SMA(50) > 長期SMA(100) → `LONG` / 短期 < 長期 → `SHORT`（ペアごとに独立。だまし低減のため 20/50 から拡大） |
 | 参考情報 | RSI(14) を計算し通知に併記 |
 | 状態管理 | **ペアごと**に `state_<PAIR>.json`（例 `state_USDJPY.json`）へ保存し、前回と変わった時だけ通知 |
 | 通知 | Slack Incoming Webhook（環境変数 `SLACK_WEBHOOK_URL`） |
