@@ -378,21 +378,28 @@ def test_heartbeat_stale_feed_warns():
 # ─────────────────────────────────────────────────────────────
 # 決定論: backtest._states と fx.evaluate の状態判定が一致
 # ─────────────────────────────────────────────────────────────
-def _synthetic_df(n=220):
-    # 振動＋微トレンドでクロスが何度も起きる合成系列。tz-aware の直近インデックス。
+def _synthetic_df(n=260):
+    # 振動＋微トレンドでクロスが何度も起きる合成OHLC。tz-aware の直近インデックス。
+    # ATRデッドバンドの検証のため High/Low も持たせる。
     end = pd.Timestamp("2026-05-29 12:00", tz="UTC")
     idx = pd.date_range(end=end, periods=n, freq="5min")
     close = [100.0 + 2.0 * math.sin(i / 6.0) + i * 0.01 for i in range(n)]
-    return pd.DataFrame({"Close": close}, index=idx)
+    high = [c + 0.05 for c in close]
+    low = [c - 0.05 for c in close]
+    return pd.DataFrame({"Open": close, "High": high, "Low": low, "Close": close}, index=idx)
 
 
 def test_determinism_backtest_matches_evaluate():
     df = _synthetic_df()
-    close = df["Close"]
-    # STALE ガードは古い合成データで誤発火するので無効化して純粋に判定だけ比較
-    for hyst in (0.0, 0.05):
-        with patched(fx, HYSTERESIS_PCT=hyst, STALE_MINUTES=0):
-            states = bt._states(close)  # backtest 側の状態列（同じ HYSTERESIS_PCT を参照）
+    # pct と atr の両モードで、backtest._states と fx.evaluate の判定が完全一致するか。
+    cases = [
+        dict(DEADBAND_MODE="pct", HYSTERESIS_PCT=0.0),
+        dict(DEADBAND_MODE="pct", HYSTERESIS_PCT=0.05),
+        dict(DEADBAND_MODE="atr", ATR_K=1.0),
+    ]
+    for case in cases:
+        with patched(fx, STALE_MINUTES=0, **case):
+            states = bt._states(df)
             assert len(states) > 50, "SMAが算出できる区間が少なすぎる"
             mism = 0
             for k in range(1, len(states)):
@@ -401,7 +408,7 @@ def test_determinism_backtest_matches_evaluate():
                 ev = fx.evaluate(df.loc[:ts], prev_state=prev)
                 if ev is None or ev["state"] != st:
                     mism += 1
-            assert mism == 0, f"ヒス{hyst}: {mism}バーで不一致"
+            assert mism == 0, f"{case}: {mism}バーで不一致"
 
 
 # ─────────────────────────────────────────────────────────────

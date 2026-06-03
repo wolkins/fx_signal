@@ -116,10 +116,16 @@ def _fetch_dukascopy(ticker: str, period: str, interval: str):
     return df
 
 
-def _states(close: pd.Series) -> list[tuple[pd.Timestamp, str, float]]:
-    """本体と同じ条件（ヒステリシス含む）で各時点の状態列を作る。"""
+def _states(df: pd.DataFrame) -> list[tuple[pd.Timestamp, str, float]]:
+    """本体(evaluate)と同じ条件（デッドバンド含む）で各時点の状態列を作る。
+
+    デッドバンド判定は fx.deadband_threshold を共用し、本体と必ず一致させる。
+    """
+    close = df["Close"].dropna()
     short = close.rolling(fx.SHORT_SMA).mean()
     long = close.rolling(fx.LONG_SMA).mean()
+    use_atr = fx.DEADBAND_MODE == "atr" and {"High", "Low"}.issubset(df.columns)
+    atr = fx.compute_atr(df, fx.ATR_PERIOD).reindex(close.index) if use_atr else None
     out: list[tuple[pd.Timestamp, str, float]] = []
     prev: str | None = None
     for ts in close.index:
@@ -127,12 +133,8 @@ def _states(close: pd.Series) -> list[tuple[pd.Timestamp, str, float]]:
         if pd.isna(s) or pd.isna(l):
             continue
         raw = "LONG" if s > l else "SHORT"
-        if (
-            fx.HYSTERESIS_PCT > 0.0
-            and prev in ("LONG", "SHORT")
-            and l != 0
-            and abs(s - l) / abs(l) * 100.0 < fx.HYSTERESIS_PCT
-        ):
+        av = atr.loc[ts] if atr is not None else None
+        if prev in ("LONG", "SHORT") and abs(s - l) < fx.deadband_threshold(l, av):
             state = prev
         else:
             state = raw
@@ -163,7 +165,7 @@ def backtest_pair(
         print(f"[{label}] 本数不足: {len(close)}本（長期SMA {fx.LONG_SMA} に届かず）")
         return 1
 
-    states = _states(close)
+    states = _states(df)
     if not states:
         print(f"[{label}] SMAが算出できる区間がありませんでした。")
         return 1
@@ -179,7 +181,8 @@ def backtest_pair(
 
     print(
         f"\n■ {label}  期間 {_jst(states[0][0])}〜{_jst(states[-1][0])}"
-        f"  / {len(states)}本 / SMA{fx.SHORT_SMA}x{fx.LONG_SMA} / ヒス {fx.HYSTERESIS_PCT}%"
+        f"  / {len(states)}本 / SMA{fx.SHORT_SMA}x{fx.LONG_SMA}"
+        f" / 不感帯 {('ATRx'+str(fx.ATR_K)) if fx.DEADBAND_MODE=='atr' else (str(fx.HYSTERESIS_PCT)+'%')}"
     )
     print(
         f"  転換 {len(changes)}回（約{per_day:.1f}回/日） / "

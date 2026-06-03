@@ -40,12 +40,16 @@ SHORT_SMA = 50            # 短期SMAの本数
 LONG_SMA = 100            # 長期SMAの本数
 RSI_PERIOD = 14           # RSIの計算期間（参考情報）
 
-# ヒステリシス（デッドバンド）: 短期SMAと長期SMAの乖離が長期SMA比でこの%未満の
-# 間は、状態を切り替えず前回状態を維持する。SMAが拮抗して LONG/SHORT が交互に
-# 揺れる「ダマシ(whipsaw)」を防ぐ。0.0 で無効（純粋なクロスのみ＝従来挙動）。
-# 0.08% は 3年バックテストで決定。SMA 50/100 と組み合わせてだましを最小化しつつ
-# gross をプラスに保つ水準（ATR連動デッドバンドは実測で逆効果のため不採用）。
-HYSTERESIS_PCT = 0.08
+# デッドバンド（ヒステリシス）: 短期SMAと長期SMAの乖離がこの幅未満の間は状態を
+# 切り替えず前回状態を維持し、SMA拮抗時の「ダマシ(whipsaw)」を防ぐ。
+#   DEADBAND_MODE="atr": 幅 = ATR_K * ATR(ATR_PERIOD)。ボラに連動。SMA 50/100 と
+#     組み合わせると、だましは少し増える(3年実測 23→86)が取り分(gross/net)は最良。
+#   DEADBAND_MODE="pct": 幅 = 長期SMA * HYSTERESIS_PCT/100（固定%。従来方式）。
+# どちらも閾値0で無効（純粋なクロスのみ）。本体とbacktestは同じ helper を使い一致させる。
+DEADBAND_MODE = "atr"     # "atr" or "pct"
+ATR_PERIOD = 14
+ATR_K = 1.0
+HYSTERESIS_PCT = 0.08     # DEADBAND_MODE="pct" の時に使う固定%
 
 # 最新足がこの分数より古ければ「市場クローズ中」とみなして何もせず終了する。
 # 土日・祝日（クリスマスや年末年始など）はFX市場が止まり足が更新されないため、
@@ -164,6 +168,26 @@ def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> float | None:
     return float(100.0 - (100.0 / (1.0 + rs)))
 
 
+def compute_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
+    """ATR(True Range の Wilder 平滑)を Series で返す。High/Low/Close を使う。"""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift()
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+
+def deadband_threshold(long_ma: float, atr_val: float | None) -> float:
+    """デッドバンド幅（価格・絶対値）を返す。乖離がこれ未満なら状態を維持する。
+
+    本体(evaluate)と backtest が必ず同じ判定になるよう、両者がこの関数を使う。
+    """
+    if DEADBAND_MODE == "atr" and atr_val is not None and not pd.isna(atr_val):
+        return ATR_K * atr_val
+    return abs(long_ma) * (HYSTERESIS_PCT / 100.0)
+
+
 def compute_change_pct(close: pd.Series, bars: int) -> float | None:
     """直近 bars 本前からの価格変化率(%)を返す。算出不能なら None。
 
@@ -219,12 +243,14 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None) -> dict | None:
 
     raw_state = "LONG" if short_ma > long_ma else "SHORT"
 
+    # デッドバンド幅（ATR連動 or 固定%）。ATRモードかつ High/Low があれば ATR を使う。
+    atr_val = None
+    if DEADBAND_MODE == "atr" and {"High", "Low"}.issubset(df.columns):
+        atr_val = compute_atr(df, ATR_PERIOD).reindex(close.index).iloc[-1]
+
     # デッドバンド内（SMAが拮抗）なら前回状態を維持してチャタリングを防ぐ
-    if (
-        HYSTERESIS_PCT > 0.0
-        and prev_state in ("LONG", "SHORT")
-        and long_ma != 0
-        and abs(short_ma - long_ma) / abs(long_ma) * 100.0 < HYSTERESIS_PCT
+    if prev_state in ("LONG", "SHORT") and abs(short_ma - long_ma) < deadband_threshold(
+        long_ma, atr_val
     ):
         state = prev_state
     else:
