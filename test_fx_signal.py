@@ -28,12 +28,14 @@ from pathlib import Path
 import pandas as pd
 
 import backtest as bt
+import dow
 import fx_signal as fx
 import risk_filter as rf
 
-# テストは作業ツリーを汚さない（監査ログ・健全性ファイルを一時パスへ退避）。
+# テストは作業ツリーを汚さない（監査ログ・健全性・ゲートログを一時パスへ退避）。
 rf.RISK_LOG_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_risk_log.jsonl"
 fx.HEALTH_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_health.json"
+dow.GATE_LOG_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_gate.jsonl"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -373,6 +375,84 @@ def test_heartbeat_stale_feed_warns():
                  notify=sent.append):
         fx.heartbeat()
     assert "古い" in sent[0]  # 全ペア古い → 固まり疑いの警告
+
+
+# ─────────────────────────────────────────────────────────────
+# ダウMTFゲート: スイング検出・トレンド判定・ゲート分岐・degrade open・先読みなし
+# ─────────────────────────────────────────────────────────────
+def test_find_swings_no_lookahead():
+    idx = pd.date_range("2026-01-01", periods=11, freq="1h", tz="UTC")
+    high = pd.Series([1, 2, 5, 2, 1, 2, 6, 2, 1, 2, 7], index=idx)
+    low = pd.Series([1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1], index=idx)
+    sw = dow.find_swings(high, low, 2, 2)
+    kinds = {(s["pos"], s["kind"]) for s in sw}
+    assert {(2, "H"), (6, "H"), (4, "L"), (8, "L")} <= kinds
+    # 末尾 right(=2) 本(pos9,10)は未確定 → 含まれない（先読みしない）
+    assert all(s["pos"] <= 8 for s in sw)
+    # no-lookahead: バーを足しても過去の確定スイングは完全に不変
+    idx2 = pd.date_range("2026-01-01", periods=12, freq="1h", tz="UTC")
+    high2 = pd.Series([1, 2, 5, 2, 1, 2, 6, 2, 1, 2, 7, 3], index=idx2)
+    low2 = pd.Series([1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1], index=idx2)
+    sw2 = dow.find_swings(high2, low2, 2, 2)
+    old = [(s["pos"], s["kind"], s["price"]) for s in sw]
+    new_sub = [(s["pos"], s["kind"], s["price"]) for s in sw2 if s["pos"] <= 8]
+    assert old == new_sub
+
+
+def _swings(highs, lows):
+    return [{"kind": "H", "price": p, "pos": i} for i, p in enumerate(highs)] + [
+        {"kind": "L", "price": p, "pos": 100 + i} for i, p in enumerate(lows)
+    ]
+
+
+def test_dow_trend():
+    assert dow.dow_trend(_swings([5, 6], [1, 2])) == "UP"
+    assert dow.dow_trend(_swings([6, 5], [2, 1])) == "DOWN"
+    assert dow.dow_trend(_swings([5, 6], [2, 1])) == "RANGE"
+    assert dow.dow_trend(_swings([5], [1])) == "UNKNOWN"
+
+
+def test_gate_branches():
+    assert dow.gate("LONG", {"4H": "UP", "1H": "UP"})["pass"] is True
+    assert dow.gate("LONG", {"4H": "RANGE", "1H": "UP"})["pass"] is False
+    assert dow.gate("SHORT", {"4H": "DOWN", "1H": "UP"})["pass"] is False
+    assert dow.gate("SHORT", {"4H": "DOWN", "1H": "DOWN"})["pass"] is True
+    # degrade open: 判定不能は素通し（RANGEと取り違えない）
+    assert dow.gate("LONG", {"4H": "UNKNOWN", "1H": "UP"})["pass"] is True
+    assert dow.gate("LONG", {"4H": "RANGE", "1H": "UP"})["reason"] == "blocked_4h_range"
+
+
+def test_gate_degrade_open_on_insufficient_data():
+    tiny = pd.DataFrame(
+        {"Open": [1, 2], "High": [1, 2], "Low": [1, 2], "Close": [1, 2]},
+        index=pd.date_range("2026-01-01", periods=2, freq="5min", tz="UTC"),
+    )
+    trends = dow.mtf_trends(tiny)
+    assert trends["4H"] == "UNKNOWN" and trends["1H"] == "UNKNOWN"
+    assert dow.gate("LONG", trends)["pass"] is True  # 素通し
+
+
+def test_gate_disabled_passes_all():
+    with patched(dow, DOW_GATE_ENABLED=False):
+        assert dow.gate("LONG", {"4H": "DOWN", "1H": "DOWN"})["pass"] is True
+
+
+def test_trend_series_no_future_leak():
+    # backtest用 trend_series が未来を先取りしないこと（prefix不変性で検証）。
+    def make(n):
+        idx = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
+        c = [100.0 + 5.0 * math.sin(i / 30.0) + i * 0.001 for i in range(n)]
+        return pd.DataFrame(
+            {"Open": c, "High": [x + 0.1 for x in c], "Low": [x - 0.1 for x in c], "Close": c},
+            index=idx,
+        )
+    df1 = make(1500)
+    df2 = make(1900)  # df1 は df2 の先頭プレフィックス（同じデータ＋未来分）
+    s1 = dow.trend_series(df1, "1h")
+    s2 = dow.trend_series(df2, "1h")
+    # df1 範囲内の時刻で asof 値が一致するはず（未来漏れがあれば食い違う）
+    for ts in df1.index[1000:1400:50]:
+        assert s1.asof(ts) == s2.asof(ts), f"未来漏れ: {ts}"
 
 
 # ─────────────────────────────────────────────────────────────

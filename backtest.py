@@ -152,7 +152,7 @@ def _changes(states) -> list[tuple[pd.Timestamp, str, str, float]]:
 
 
 def backtest_pair(
-    ticker: str, period: str, interval: str, detail: bool, source: str
+    ticker: str, period: str, interval: str, detail: bool, source: str, gate: bool = False
 ) -> int:
     label = fx.pair_label(ticker)
     dec = fx.pair_decimals(ticker)
@@ -202,7 +202,38 @@ def backtest_pair(
                 f"  （前回から {_td(ts - prev_ts)}）"
             )
             prev_ts = ts
+
+    if gate and changes:
+        _print_gate_comparison(df, changes)
     return 0
+
+
+def _print_gate_comparison(df: pd.DataFrame, changes: list) -> None:
+    """各SMA転換に MTFゲートを当て、通過/抑制の内訳を出す（before/after比較）。"""
+    import dow
+
+    from collections import Counter
+
+    tr4 = dow.trend_series(df, dow.ENV_TF)
+    tr1 = dow.trend_series(df, dow.TRADE_TF)
+    reasons: Counter = Counter()
+    passed = 0
+    for ts, _frm, to, _price in changes:
+        # 先読みなし: その時刻までに確定した上位足トレンドを asof 参照
+        t4 = tr4.asof(ts)
+        t1 = tr1.asof(ts)
+        res = dow.gate(to, {"4H": t4 if pd.notna(t4) else "UNKNOWN",
+                            "1H": t1 if pd.notna(t1) else "UNKNOWN"})
+        if res["pass"]:
+            passed += 1
+        reasons[res["reason"]] += 1
+    blocked = len(changes) - passed
+    detail = " / ".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+    print(
+        f"  ゲート(SWING {dow.SWING_LEFT}/{dow.SWING_RIGHT}): "
+        f"転換 {len(changes)} → 通過 {passed} / 抑制 {blocked}"
+    )
+    print(f"     内訳: {detail}")
 
 
 def _jst(ts: pd.Timestamp) -> str:
@@ -228,12 +259,15 @@ def main(argv: list[str]) -> int:
     # 残りの位置引数は period, interval。
     args: list[str] = []
     source = "yfinance"
+    gate = False
     it = iter(argv)
     for a in it:
         if a == "--source":
             source = next(it, "yfinance")
         elif a.startswith("--source="):
             source = a.split("=", 1)[1]
+        elif a == "--gate":  # MTFゲート有無の比較出力を追加
+            gate = True
         else:
             args.append(a)
 
@@ -243,11 +277,14 @@ def main(argv: list[str]) -> int:
 
     tickers = [single] if single else fx.PAIRS
     print(f"バックテスト: {', '.join(fx.pair_label(t) for t in tickers)}"
-          f"  / source={source} / period={period} / interval={interval}")
+          f"  / source={source} / period={period} / interval={interval}"
+          f"{' / gate比較' if gate else ''}")
     rc = 0
     for t in tickers:
         try:
-            rc |= backtest_pair(t, period, interval, detail=bool(single), source=source)
+            rc |= backtest_pair(
+                t, period, interval, detail=bool(single), source=source, gate=gate
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"[{fx.pair_label(t)}] エラー: {exc}")
             rc = 1

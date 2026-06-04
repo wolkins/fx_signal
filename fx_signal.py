@@ -439,8 +439,39 @@ def process_pair(ticker: str) -> str:
         return "first_run"
 
     if prev.get("state") != info["state"]:
-        # 状態が変わった瞬間だけ通知。
-        # ここでのみリスク層を呼ぶ（＝LLM呼び出しは状態変化時に限定しコスト最小化）。
+        # 状態が変わった瞬間だけ処理する。
+        # ① まず MTF コンフルエンス・ゲート（ダウ理論）を評価する。
+        #    上位足と一致しなければ「抑制」＝通知せずログに残し状態だけ更新する。
+        #    ゲートを通った合図にだけ後段のリスク層(LLM)を適用する＝無駄打ち防止。
+        #    ゲートの失敗(例外/データ不足)は degrade open＝素通し（本体は止めない）。
+        gate_pass = True
+        gate_result = None
+        try:
+            import dow  # 遅延 import（付加層）
+            if dow.DOW_GATE_ENABLED:
+                trends = dow.mtf_trends(df)
+                gate_result = dow.gate(info["state"], trends)
+                gate_pass = gate_result["pass"]
+        except Exception as exc:  # noqa: BLE001 - ゲートの失敗で本体を止めない（degrade open）
+            print(f"[{label}] ゲートでエラー（素通し）: {exc}", file=sys.stderr)
+            gate_pass = True
+
+        if not gate_pass:
+            # 抑制: 通知せずログに記録し、状態だけ更新（この合図は見送る）。
+            try:
+                dow.log_suppression(label, info["state"], gate_result, info["price"])
+            except Exception:  # noqa: BLE001
+                pass
+            save_state(path, info)
+            print(
+                f"[{label}] ゲート抑制: {prev.get('state')} → {info['state']}"
+                f" (4H={gate_result['trend_4h']}/1H={gate_result['trend_1h']}"
+                f" reason={gate_result['reason']})"
+            )
+            return "blocked"
+
+        # ② 通った合図のみ: リスク層を評価して通知する。
+        # ここでのみリスク層を呼ぶ（＝LLM呼び出しはゲート通過時に限定しコスト最小化）。
         # リスク層が何を返しても/失敗しても、本体のシグナル通知は必ず出す。
         # import 自体も try 内に置き、モジュール不備でも本体を止めない。
         risk = None
@@ -461,9 +492,10 @@ def process_pair(ticker: str) -> str:
         save_state(path, info)
         rlevel = risk.get("risk_level") if risk else "unknown"
         rstatus = risk.get("status") if risk else "unknown"
+        gate_note = f" / ゲート: {gate_result['reason']}" if gate_result else ""
         print(
             f"[{label}] 状態変化: {prev.get('state')} → {info['state']}"
-            f" / リスク: {rlevel} (status={rstatus})"
+            f" / リスク: {rlevel} (status={rstatus}){gate_note}"
         )
         return "changed"
     else:
@@ -582,7 +614,7 @@ def main() -> int:
     # 市場クローズは "no_data" なので除外され、誤検知しない。
     # "error"（process_pairが例外）も含めることで、例外を投げ続ける故障も拾える。
     all_failed = bool(outcomes) and all(o in ("fetch_failed", "error") for o in outcomes)
-    data_ok = any(o in ("first_run", "changed", "nochange") for o in outcomes)
+    data_ok = any(o in ("first_run", "changed", "nochange", "blocked") for o in outcomes)
     try:
         update_data_health(all_failed, data_ok)
     except Exception as exc:  # noqa: BLE001 - 健全性チェックの失敗で本体を止めない

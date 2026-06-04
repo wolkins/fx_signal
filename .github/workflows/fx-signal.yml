@@ -58,6 +58,10 @@ jobs:
           if [ "${COMMIT_RISK_LOG:-true}" = "true" ] && [ -f risk_log.jsonl ]; then
             git add risk_log.jsonl
           fi
+          # ゲート抑制ログ(gate_log.jsonl)も同様にフラグで選べる（機密は記録しない）。
+          if [ "${COMMIT_GATE_LOG:-true}" = "true" ] && [ -f gate_log.jsonl ]; then
+            git add gate_log.jsonl
+          fi
           # 差分が無い時は commit しない
           if git diff --cached --quiet; then
             echo "差分なし — commit をスキップします。"
