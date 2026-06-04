@@ -7,3 +7,8 @@ venv/
 # VPS運用: 秘密情報とログはコミットしない
 fx-signal.env
 cron.log
+# 状態・ログはVPSローカルで永続化（git追跡しない＝pull衝突を防ぐ）
+state_*.json
+gate_log.jsonl
+risk_log.jsonl
+data_health.json

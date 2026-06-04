@@ -21,21 +21,42 @@ trend の値: "UP" / "DOWN" / "RANGE" / "UNKNOWN"
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+
+def _coerce_bool(value) -> bool:
+    """真偽値を頑健に判定。文字列 "false"/"true" も正しく扱う（"false"の罠回避）。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return False
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """環境変数があればそれを優先（_coerce_bool 解釈）、無ければ default。"""
+    raw = os.environ.get(name)
+    return _coerce_bool(raw) if raw not in (None, "") else default
+
+
 # ─────────────────────────────────────────────────────────────
 # パラメータ（Dukascopy較正前提のたたき台）
+# DOW_GATE_ENABLED / RANGE_BLOCKS は環境変数で上書き可能（fx-signal.env で切替）。
 # ─────────────────────────────────────────────────────────────
-DOW_GATE_ENABLED = True   # False でゲートを丸ごと無効化（完全に従来挙動）
+DOW_GATE_ENABLED = _env_bool("DOW_GATE_ENABLED", True)  # False でゲートを丸ごと無効化
 SWING_LEFT = 2            # スイング確定: 左 left 本より高い/低い
 SWING_RIGHT = 2           # スイング確定: 右 right 本より高い/低い（後続が要る＝先読みしない）
 ENV_TF = "4h"            # 環境足
 TRADE_TF = "1h"          # トレード足
-RANGE_BLOCKS = True       # True=上位足RANGEは通さない（保守的）/ False=RANGEは許容
+# 開始設定は False（逆行のみ抑制）。RANGE抑制(約95%カット)は損益検証後に有効化する方針。
+RANGE_BLOCKS = _env_bool("RANGE_BLOCKS", False)  # True=上位足RANGEも抑制 / False=RANGE許容
 
 GATE_LOG_ENABLED = True
 GATE_LOG_FILE = Path(__file__).with_name("gate_log.jsonl")

@@ -413,13 +413,37 @@ def test_dow_trend():
 
 
 def test_gate_branches():
+    # 方向一致は通過 / 逆行は常に抑制 / 判定不能は素通し（RANGE_BLOCKS 非依存）
     assert dow.gate("LONG", {"4H": "UP", "1H": "UP"})["pass"] is True
-    assert dow.gate("LONG", {"4H": "RANGE", "1H": "UP"})["pass"] is False
-    assert dow.gate("SHORT", {"4H": "DOWN", "1H": "UP"})["pass"] is False
+    assert dow.gate("SHORT", {"4H": "DOWN", "1H": "UP"})["pass"] is False  # 1H逆行
     assert dow.gate("SHORT", {"4H": "DOWN", "1H": "DOWN"})["pass"] is True
-    # degrade open: 判定不能は素通し（RANGEと取り違えない）
-    assert dow.gate("LONG", {"4H": "UNKNOWN", "1H": "UP"})["pass"] is True
-    assert dow.gate("LONG", {"4H": "RANGE", "1H": "UP"})["reason"] == "blocked_4h_range"
+    assert dow.gate("LONG", {"4H": "UNKNOWN", "1H": "UP"})["pass"] is True  # degrade open
+    # RANGE の扱いは RANGE_BLOCKS 次第（デフォルト値に依存せず明示して検証）
+    with patched(dow, RANGE_BLOCKS=True):
+        r = dow.gate("LONG", {"4H": "RANGE", "1H": "UP"})
+        assert r["pass"] is False and r["reason"] == "blocked_4h_range"
+    with patched(dow, RANGE_BLOCKS=False):
+        r = dow.gate("LONG", {"4H": "RANGE", "1H": "UP"})
+        assert r["pass"] is True and r["reason"] == "ok"
+
+
+def test_env_bool_override():
+    # 未設定 → default
+    with no_env("RANGE_BLOCKS"):
+        assert dow._env_bool("RANGE_BLOCKS", False) is False
+        assert dow._env_bool("RANGE_BLOCKS", True) is True
+    # env があれば優先。"false" 文字列を正しく False に（罠回避）
+    for val, expect in (("true", True), ("false", False), ("True", True),
+                        ("1", True), ("no", False), ("", True)):
+        if val == "":
+            with no_env("DOW_GATE_ENABLED"):
+                assert dow._env_bool("DOW_GATE_ENABLED", True) is True
+            continue
+        os.environ["DOW_GATE_ENABLED"] = val
+        try:
+            assert dow._env_bool("DOW_GATE_ENABLED", True) is expect, val
+        finally:
+            os.environ.pop("DOW_GATE_ENABLED", None)
 
 
 def test_gate_degrade_open_on_insufficient_data():
