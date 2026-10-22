@@ -41,6 +41,14 @@ PAIRS = ["USDJPY=X", "AUDJPY=X", "NZDJPY=X"]
 #   "sma_cross": 従来の 5分足 SMA50/100 クロスで LONG/SHORT を判定するドテン合図。
 #       3年実測でエッジがあるのは USD/JPY のみ（AUD/JPY ≈0、NZD/JPY は負）。
 STRATEGY = os.environ.get("STRATEGY", "long_guard").strip().lower() or "long_guard"
+
+# long_guard のエンジンをペアごとに選ぶ。
+#   "sma": 日足 SMA50・帯±2%（long_guard.py）
+#   "dow": 日足ダウ理論（dow_guard.py）
+# 3年＋直近2年の検証で、USD/JPY は SMA、AUD/JPY・NZD/JPY はダウが良かった（dow_guard.py 冒頭参照）。
+# 環境変数 GUARD_DOW_PAIRS="AUDJPY,NZDJPY" で上書き可（列挙したペアが dow、他は sma）。
+GUARD_BY_PAIR = {"USDJPY=X": "sma", "AUDJPY=X": "dow", "NZDJPY=X": "dow"}
+GUARD_DEFAULT_ENGINE = "sma"
 INTERVAL = "5m"           # 足種（例: "5m", "15m", "1h", "1d"）
 # 取得期間。"1mo" にして上位足(4H)の本数を確保し、ライブのダウ判定を安定させる
 # （5d だと4H足が約30本でUNKNOWN多め）。SMA/ATR/STALE は末尾のみ参照のため影響なし。
@@ -108,6 +116,24 @@ def pair_decimals(ticker: str) -> int:
 def state_path(ticker: str) -> Path:
     """ペアごとの状態ファイル。'USDJPY=X' → state_USDJPY.json。"""
     return Path(__file__).with_name(f"state_{pair_code(ticker)}.json")
+
+
+def guard_engine(ticker: str) -> str:
+    """このペアのロング保護エンジン名("sma"/"dow")。環境変数 GUARD_DOW_PAIRS が優先。"""
+    env = os.environ.get("GUARD_DOW_PAIRS")
+    if env is not None:
+        dow_codes = {c.strip().upper().replace("=X", "") for c in env.split(",") if c.strip()}
+        return "dow" if pair_code(ticker) in dow_codes else "sma"
+    return GUARD_BY_PAIR.get(ticker, GUARD_DEFAULT_ENGINE)
+
+
+def guard_module(engine: str):
+    """エンジン名 → モジュール（遅延 import。付加層の不備で本体を止めない）。"""
+    if engine == "dow":
+        import dow_guard
+        return dow_guard
+    import long_guard
+    return long_guard
 
 
 # ─────────────────────────────────────────────────────────────
@@ -303,6 +329,7 @@ def save_state(path: Path, info: dict) -> None:
         "price": info["price"],
         "time": info["time"],
         "strategy": STRATEGY,
+        "guard": info.get("guard"),
         "updated_at": datetime.now(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
     }
     path.write_text(
@@ -538,11 +565,14 @@ def _process_pair_guard(ticker: str) -> str:
     """ロング保護モード（STRATEGY="long_guard"）の1ペア処理。
 
     確定日足だけで HOLD/EXIT を判定し、切り替わった日に1回だけ通知する。
+    エンジンはペアごとに guard_engine() で選ぶ（sma=long_guard / dow=dow_guard）。
     状態は 1日に最大1回しか変わらないので、cron が5分おきでも通知は増えない。
-    旧戦略の状態ファイル（LONG/SHORT）が残っていれば初回扱いで現在の状態を通知して上書きする。
+    旧戦略の状態ファイル（LONG/SHORT）や別エンジンで保存した状態が残っていれば、
+    初回扱いで現在の状態を通知して上書きする。
     返り値は process_pair と同じ種別（データ健全性チェックで共用）。
     """
-    import long_guard as lg  # 遅延 import（付加層。読み込み失敗は呼び出し側の try で隔離）
+    engine = guard_engine(ticker)
+    lg = guard_module(engine)  # 遅延 import（付加層。読み込み失敗は呼び出し側の try で隔離）
 
     label = pair_label(ticker)
     decimals = pair_decimals(ticker)
@@ -550,7 +580,9 @@ def _process_pair_guard(ticker: str) -> str:
     path = state_path(ticker)
 
     prev = load_state(path)
-    prev_state = lg.normalize_prev(prev.get("state") if prev else None)
+    prev_state = None
+    if prev and prev.get("guard", "sma") == engine:  # 別エンジンの状態は引き継がない
+        prev_state = lg.normalize_prev(prev.get("state"))
 
     df = fetch_data(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
     if df is None or df.empty:
@@ -559,17 +591,18 @@ def _process_pair_guard(ticker: str) -> str:
 
     info = lg.evaluate(df, prev_state=prev_state)
     if info is None:
-        print(f"[{label}] 日足の本数不足/鮮度不良のため判定をスキップ。")
+        print(f"[{label}] 日足の本数不足/鮮度不良/判定不能のため判定をスキップ（{engine}）。")
         return "no_data"
+    info["guard"] = engine
 
     if prev_state is None:
         notify(lg.format_message(info, label=label, decimals=decimals, first_run=True))
         save_state(path, info)
-        print(f"[{label}] ロング保護 初回起動: 状態を {info['state']} で保存しました。")
+        print(f"[{label}] ロング保護({engine}) 初回起動: 状態を {info['state']} で保存しました。")
         return "first_run"
 
     if prev_state == info["state"]:
-        print(f"[{label}] ロング保護 状態変化なし: {info['state']}（通知スキップ）")
+        print(f"[{label}] ロング保護({engine}) 状態変化なし: {info['state']}（通知スキップ）")
         return "nochange"
 
     # 切替時のみ: リスク層（経済イベント）を添えて通知する。ダウMTFゲートは5分足前提の
@@ -579,7 +612,7 @@ def _process_pair_guard(ticker: str) -> str:
     notify(_risk_prefix(risk) + body + _risk_footer(risk))
     save_state(path, info)
     print(
-        f"[{label}] ロング保護 状態変化: {prev_state} → {info['state']}"
+        f"[{label}] ロング保護({engine}) 状態変化: {prev_state} → {info['state']}"
         f" / リスク: {risk.get('risk_level') if risk else 'unknown'}"
         f" (status={risk.get('status') if risk else 'unknown'})"
     )
@@ -663,11 +696,13 @@ def heartbeat() -> int:
             s = st.get("state")
             if s in ("LONG", "SHORT"):
                 stance = "買い📈" if s == "LONG" else "売り📉"
+                tag = ""
             else:
                 import long_guard as lg
                 stance = lg.stance_label(s)
+                tag = " [SMA]" if st.get("guard", "sma") == "sma" else " [ダウ]"
             lines.append(
-                f"・{label}: 現在 {st.get('state')}（{stance}） / {st.get('updated_at', '?')} 時点"
+                f"・{label}{tag}: 現在 {st.get('state')}（{stance}） / {st.get('updated_at', '?')} 時点"
             )
         else:
             lines.append(f"・{label}: 状態未確定（次のオープンで初期化されます）")

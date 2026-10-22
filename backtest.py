@@ -21,9 +21,10 @@
     例: python backtest.py --source dukascopy USDJPY=X 1y 5m
 
 ロング保護ガード（--guard）:
-    python backtest.py --guard 1y 1d                       # 日足で全ペア（買い持ちと比較）
+    python backtest.py --guard 1y 1d                       # 日足で全ペア（買い持ちと比較。エンジンは本体のペア別設定）
     python backtest.py --guard --source dukascopy 3y 5m    # 5分足→日足に集約して3年
     python backtest.py --guard AUDJPY=X 1y 1d              # 単一ペアを切替履歴つきで
+    python backtest.py --guard --engine both 2y 1d         # SMA とダウの両エンジンを並べて比較（sma/dow/both）
 """
 
 from __future__ import annotations
@@ -291,9 +292,14 @@ def _max_dd(daily_pnl: pd.Series) -> float:
     return float((eq.cummax() - eq).max())
 
 
-def backtest_guard(ticker: str, period: str, interval: str, detail: bool, source: str) -> int:
-    """long_guard.guard_states を過去データに流し、買い持ちとの比較を出す。"""
-    import long_guard as lg
+def backtest_guard(ticker: str, period: str, interval: str, detail: bool, source: str,
+                   engine: str | None = None) -> int:
+    """ロング保護ガードを過去データに流し、買い持ちとの比較を出す。
+
+    engine: "sma"（long_guard）/ "dow"（dow_guard）/ None（本体の guard_engine() に従う）。
+    """
+    engine = engine or fx.guard_engine(ticker)
+    lg = fx.guard_module(engine)
 
     label = fx.pair_label(ticker)
     dec = fx.pair_decimals(ticker)
@@ -304,11 +310,20 @@ def backtest_guard(ticker: str, period: str, interval: str, detail: bool, source
         print(f"[{label}] データを取得できませんでした（Open/Close が必要）。")
         return 1
     daily = _to_daily(df, interval)
-    if len(daily) < lg.GUARD_SMA_DAYS + 5:
-        print(f"[{label}] 日足本数不足: {len(daily)}本（SMA{lg.GUARD_SMA_DAYS} に届かず）")
+    if engine == "dow":
+        need = lg.MIN_BARS
+        desc = f"日足ダウ理論（山谷 左右{lg.PIVOT_LR}本・{lg.MIN_WAVE}本未満の波は無視）"
+        if {"High", "Low"} - set(daily.columns):
+            print(f"[{label}] dow エンジンには High/Low が必要です。")
+            return 1
+    else:
+        need = lg.GUARD_SMA_DAYS + 5
+        desc = f"日足SMA{lg.GUARD_SMA_DAYS}・帯±{lg.GUARD_BAND_PCT:g}%"
+    if len(daily) < need:
+        print(f"[{label}] 日足本数不足: {len(daily)}本（{need}本必要）")
         return 1
 
-    st = lg.guard_states(daily["Close"])
+    st = lg.guard_states(daily) if engine == "dow" else lg.guard_states(daily["Close"])
     hold = st == lg.STATE_HOLD
     valid = st.notna()
     # 比較対象の買い持ちは、ガードが判定可能になった日以降で揃える
@@ -318,7 +333,7 @@ def backtest_guard(ticker: str, period: str, interval: str, detail: bool, source
 
     print(
         f"\n■ {label}  期間 {daily.index[0].date()}〜{daily.index[-1].date()} / 日足 {len(daily)}本"
-        f" / ガード: 日足SMA{lg.GUARD_SMA_DAYS}・帯±{lg.GUARD_BAND_PCT:g}% / スプレッド往復 {spread}pips"
+        f" / ガード[{engine}]: {desc} / スプレッド往復 {spread}pips"
     )
     print(
         f"  買い持ち : 損益 {sum(bh_trades):>7.0f} pips / 最大DD {_max_dd(bh_daily):>6.0f} / 在場 100%"
@@ -367,6 +382,7 @@ def main(argv: list[str]) -> int:
     source = "yfinance"
     gate = False
     guard = False
+    engine: str | None = None
     it = iter(argv)
     for a in it:
         if a == "--source":
@@ -375,8 +391,12 @@ def main(argv: list[str]) -> int:
             source = a.split("=", 1)[1]
         elif a == "--gate":  # MTFゲート有無の比較出力を追加
             gate = True
-        elif a == "--guard":  # ロング保護ガード（long_guard.py）の損益評価
+        elif a == "--guard":  # ロング保護ガード（long_guard / dow_guard）の損益評価
             guard = True
+        elif a == "--engine":  # --guard のエンジン強制: sma / dow / both（既定: 本体のペア別設定）
+            engine = next(it, None)
+        elif a.startswith("--engine="):
+            engine = a.split("=", 1)[1]
         else:
             args.append(a)
 
@@ -392,7 +412,9 @@ def main(argv: list[str]) -> int:
     for t in tickers:
         try:
             if guard:
-                rc |= backtest_guard(t, period, interval, detail=bool(single), source=source)
+                engines = ["sma", "dow"] if engine == "both" else [engine]
+                for e in engines:
+                    rc |= backtest_guard(t, period, interval, detail=bool(single), source=source, engine=e)
                 continue
             rc |= backtest_pair(
                 t, period, interval, detail=bool(single), source=source, gate=gate

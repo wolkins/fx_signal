@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""『FXチャート見える化ダウ理論』の規則をロング保護向けに機械化し、損益で検証する（読み取り専用）。
+"""日足ダウ理論（実質押し安値・戻り高値・6本のタメ）の規則をロング保護向けに機械化し、損益で検証する（読み取り専用）。
 
 本の規則 → 実装の対応（ユーザー提供の要約に基づく）:
   - 波（山/谷）: 「山全体で6本程度のタメ」→ ピボット(左右 PIVOT 本)で山谷を取り、
@@ -74,7 +74,7 @@ def pivots(bars: pd.DataFrame, lr: int) -> list[Pivot]:
 
 
 class DowMachine:
-    """1つの時間足に対する、見える化ダウ理論のロング向け状態機械（先読みなし）。"""
+    """1つの時間足に対する、ダウ理論のロング向け状態機械（先読みなし）。"""
 
     def __init__(self, bars: pd.DataFrame, lr: int = 3, min_wave: int = 6, double_bottom: bool = False):
         self.bars = bars

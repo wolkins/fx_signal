@@ -42,6 +42,7 @@ GUARD_STALE_DAYS = 5      # 最新確定足がこれより古ければデータ�
 STATE_HOLD = "HOLD"       # ロング維持
 STATE_EXIT = "EXIT"       # ロング離脱（待機）
 STATES = (STATE_HOLD, STATE_EXIT)
+ENGINE = "sma"
 
 
 # ─────────────────────────────────────────────────────────────

@@ -620,9 +620,9 @@ def test_guard_backtest_consistent_with_module():
     with patched(bt, fetch_history=lambda t, p, i, s: df):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = bt.backtest_guard("AUDJPY=X", "1y", "1d", detail=True, source="x")
+            rc = bt.backtest_guard("AUDJPY=X", "1y", "1d", detail=True, source="x", engine="sma")
     out = buf.getvalue()
-    assert rc == 0 and "買い持ち" in out and "ガード" in out and "切替履歴" in out
+    assert rc == 0 and "買い持ち" in out and "ガード[sma]" in out and "切替履歴" in out
 
 
 def test_strategy_default_and_env_override():
@@ -643,6 +643,161 @@ def test_strategy_default_and_env_override():
             _os.environ["STRATEGY"] = saved
         importlib.reload(fx)
         fx.HEALTH_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_health.json"
+
+
+# ─────────────────────────────────────────────────────────────
+# ロング保護ガード（dow_guard.py）とペア別エンジン選択
+# ─────────────────────────────────────────────────────────────
+import dow_guard as dg  # noqa: E402
+
+
+def _ohlc_df(closes, start="2024-01-01", wick=0.05):
+    # High/Low は終値±ヒゲ（始値基準にすると山頂の High が隣と同値になりピボットが立たない）
+    idx = pd.date_range(start, periods=len(closes), freq="D")
+    c = pd.Series(closes, index=idx, dtype=float)
+    o = c.shift(1).fillna(c.iloc[0])
+    return pd.DataFrame({"Open": o, "High": c + wick, "Low": c - wick, "Close": c})
+
+
+def _wave_closes():
+    # 上昇(谷→山)・調整・高値更新・大きな崩れ・底固め・復帰、を日足で描く決定論的な系列
+    seg = []
+    seg += [100 + 0.5 * i for i in range(12)]          # 上昇 → 山 A(105.5)
+    seg += [105.5 - 0.3 * i for i in range(1, 9)]      # 調整 → 谷 B(103.1)  ※8本=大きい波
+    seg += [103.1 + 0.6 * i for i in range(1, 10)]     # 高値更新 → 山 C(108.5)。ここで押し安値=B
+    seg += [108.5 - 0.2 * i for i in range(1, 8)]      # 浅い調整 → 谷 D(107.1)（押し安値はまだ B）
+    seg += [107.1 + 0.4 * i for i in range(1, 8)]      # 再上昇 → 山 E(109.9)。C 超えで押し安値=D
+    seg += [109.9 - 0.9 * i for i in range(1, 12)]     # 大崩れ: D(107.1) を終値で割る → EXIT
+    seg += [100.0 + 0.2 * i for i in range(1, 9)]      # 底固め → 小山 F(101.6)
+    seg += [101.6 - 0.1 * i for i in range(1, 8)]      # 小さな押し
+    seg += [100.9 + 0.5 * i for i in range(1, 10)]     # F を終値で超える → HOLD 復帰
+    return seg
+
+
+def test_dow_pivots_confirm_without_lookahead():
+    df = _ohlc_df(_wave_closes())
+    piv = dg.find_pivots(df, 3)
+    assert piv and all(p.kind in ("H", "L") for p in piv)
+    # 山は左右3本より厳密に高い: 末尾3本は確定できない
+    assert all(p.pos + 3 <= len(df) - 1 for p in piv)
+    kinds = [p.kind for p in piv]
+    assert "H" in kinds and "L" in kinds
+
+
+def test_dow_state_machine_rules():
+    df = _ohlc_df(_wave_closes())
+    res = dg.analyze(df)
+    st = res["states"].dropna()
+    assert set(st.unique()) == {dg.STATE_HOLD, dg.STATE_EXIT}, "HOLD/EXIT の両方が出る系列"
+    flips = st[st != st.shift()]
+    seq = list(flips)
+    # 上昇(HOLD) → 崩れ(EXIT) → 復帰(HOLD) の順で遷移する
+    assert dg.STATE_HOLD in seq and dg.STATE_EXIT in seq
+    i_h = seq.index(dg.STATE_HOLD)
+    assert dg.STATE_EXIT in seq[i_h + 1:] and dg.STATE_HOLD in seq[seq.index(dg.STATE_EXIT, i_h + 1) + 1:]
+    # 崩れの直前の実質押し安値は「浅い調整の谷 D(≈107.1)」= 高値更新で切り上がっている
+    exit_day = flips[flips == dg.STATE_EXIT].index[0]
+    before = dg.analyze(df.loc[:exit_day - pd.Timedelta(days=1)])
+    assert before["trend"] == dg.STATE_HOLD and before["key_low"] is not None
+    assert 106.5 < before["key_low"].price < 107.5, before["key_low"]
+    # 崩れた日は終値 < 実質押し安値（ヒゲ先）
+    assert float(df.loc[exit_day, "Close"]) < before["key_low"].price
+    # 最終状態は復帰(HOLD)で、押し安値は底固めの谷に更新されている
+    assert res["trend"] == dg.STATE_HOLD and res["key_low"].price < 103.0
+
+
+def test_dow_online_prefix_consistency():
+    # 系列を途中で切っても過去の状態が変わらない（先読みなし）
+    df = _ohlc_df(_wave_closes())
+    full = dg.analyze(df)["states"]
+    for cut in range(20, len(df), 7):
+        part = dg.analyze(df.iloc[:cut])["states"]
+        assert (full.iloc[:cut].fillna("-") == part.fillna("-")).all(), f"cut={cut} で不一致"
+
+
+def test_dow_min_wave_ignores_small_waves():
+    df = _ohlc_df(_wave_closes())
+    big = dg.analyze(df, lr=3, min_wave=6)["states"].dropna()
+    small = dg.analyze(df, lr=3, min_wave=0)["states"].dropna()
+    n_big = int((big != big.shift()).sum())
+    n_small = int((small != small.shift()).sum())
+    assert n_big <= n_small, "大きく数える方が切替は少ないか同数"
+
+
+def test_dow_evaluate_guards_and_message():
+    df = _ohlc_df(_wave_closes())
+    last = df.index[-1]
+    # 本数不足
+    assert dg.evaluate(df.iloc[:30], now_utc=datetime(2024, 3, 1, tzinfo=timezone.utc)) is None
+    # 鮮度不良
+    assert dg.evaluate(df, now_utc=(last + pd.Timedelta(days=30)).to_pydatetime().replace(tzinfo=timezone.utc)) is None
+    # 正常: 当日バーは落ちる → 最終確定日は last-1
+    now = last.to_pydatetime().replace(tzinfo=timezone.utc)
+    info = dg.evaluate(df, now_utc=now)
+    assert info is not None and info["state"] in dg.STATES
+    assert (last - pd.Timedelta(days=1)).strftime("%Y-%m-%d") in info["time"]
+    assert "change_15m_pct" in info and "change_1h_pct" in info
+    m = dg.format_message(info, label="AUD/JPY", first_run=True)
+    assert "監視を開始" in m and info["state"] in m
+    ex = {"state": dg.STATE_EXIT, "price": 100.0, "key_low": 101.2, "key_low_date": "2024-03-01",
+          "reentry_high": None, "time": "2024-03-10 確定日足"}
+    m2 = dg.format_message(ex, label="NZD/JPY")
+    assert "離脱" in m2 and "101.200" in m2 and "半分" in m2
+    ho = {**ex, "state": dg.STATE_HOLD, "key_low": 99.5}
+    m3 = dg.format_message(ho, label="NZD/JPY")
+    assert "復帰" in m3 and "99.500" in m3
+
+
+def test_guard_engine_mapping_and_env_override():
+    import os as _os
+    saved = _os.environ.pop("GUARD_DOW_PAIRS", None)
+    try:
+        assert fx.guard_engine("USDJPY=X") == "sma"
+        assert fx.guard_engine("AUDJPY=X") == "dow" and fx.guard_engine("NZDJPY=X") == "dow"
+        assert fx.guard_engine("EURUSD=X") == fx.GUARD_DEFAULT_ENGINE
+        _os.environ["GUARD_DOW_PAIRS"] = "usdjpy, EURUSD=X"
+        assert fx.guard_engine("USDJPY=X") == "dow" and fx.guard_engine("EURUSD=X") == "dow"
+        assert fx.guard_engine("AUDJPY=X") == "sma"
+        _os.environ["GUARD_DOW_PAIRS"] = ""
+        assert fx.guard_engine("AUDJPY=X") == "sma"
+    finally:
+        if saved is None:
+            _os.environ.pop("GUARD_DOW_PAIRS", None)
+        else:
+            _os.environ["GUARD_DOW_PAIRS"] = saved
+    assert fx.guard_module("dow") is dg and fx.guard_module("sma") is lg
+
+
+def test_guard_backtest_dow_engine_runs():
+    df = _ohlc_df(_wave_closes())
+    with patched(bt, fetch_history=lambda t, p, i, s: df):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bt.backtest_guard("NZDJPY=X", "1y", "1d", detail=True, source="x", engine="dow")
+    out = buf.getvalue()
+    assert rc == 0 and "ガード[dow]" in out and "切替履歴" in out
+
+
+def test_dow_wave_rule_leg_ignores_short_bounces():
+    # 下落中に 4〜5本の短い戻りを挟む系列: leg は戻り高値を数えず復帰ラインが据え置き、hill は追従する
+    seg = [100 + 0.5 * i for i in range(12)]            # 上昇 → 山
+    seg += [105.5 - 0.3 * i for i in range(1, 9)]        # 谷（8本）
+    seg += [103.1 + 0.6 * i for i in range(1, 10)]       # 高値更新 → 押し安値確定
+    seg += [108.5 - 0.9 * i for i in range(1, 12)]       # 崩れ → EXIT
+    for k in range(3):                                   # 短い戻り(4本)と下落(8本)を繰り返す
+        base = seg[-1]
+        seg += [base + 0.3 * i for i in range(1, 5)]
+        seg += [seg[-1] - 0.4 * i for i in range(1, 9)]
+    df = _ohlc_df(seg)
+    leg = dg.analyze(df, lr=3, min_wave=6, wave_rule="leg")
+    hill = dg.analyze(df, lr=3, min_wave=6, wave_rule="hill")
+    assert leg["trend"] == dg.STATE_EXIT and hill["trend"] == dg.STATE_EXIT
+    # hill は短い戻りの山を採用するので復帰ラインが下がる。leg は崩れ直後の山（または未形成）のまま
+    if leg["reentry_high"] is not None and hill["reentry_high"] is not None:
+        assert hill["reentry_high"].price <= leg["reentry_high"].price
+        assert hill["reentry_high"].pos >= leg["reentry_high"].pos
+    # 既定は leg（較正で安定）
+    assert dg.WAVE_RULE == "leg"
 
 
 # ─────────────────────────────────────────────────────────────
