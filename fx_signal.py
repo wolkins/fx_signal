@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""USD/JPY 個人用シグナル監視ツール.
+"""JPYクロス 個人用シグナル監視ツール.
 
-短期SMAと長期SMAのクロスで買い/売りの状態を判定し、状態が変わった瞬間だけ
-Slack に通知する。自動売買はしない（発注は手動）。
-
-設定はファイル冒頭の定数で変更できる。
+既定（STRATEGY="long_guard"）: スワップ狙いの買い持ちを守るため、確定日足の
+SMA50・帯±2% で「ロング維持(HOLD)/離脱(EXIT)」を判定し、切り替わった時だけ
+Slack に通知する（判定は long_guard.py）。
+従来（STRATEGY="sma_cross"）: 5分足 SMA50/100 クロスで LONG/SHORT のドテン合図。
+いずれも自動売買はしない（発注は手動）。設定はファイル冒頭の定数で変更できる。
 """
 
 from __future__ import annotations
@@ -31,6 +32,15 @@ import yfinance as yf
 # 監視する通貨ペア（yfinanceティッカー）のリスト。増減はここだけで完結する。
 # ラベル・小数桁・カレンダー対象通貨はティッカーから自動導出する（下のヘルパ参照）。
 PAIRS = ["USDJPY=X", "AUDJPY=X", "NZDJPY=X"]
+
+# 戦略モード（環境変数 STRATEGY で上書き可。fx-signal.env で切替、コミット不要）。
+#   "long_guard"（既定）: ロング保護。確定日足 SMA50・帯±2% で HOLD(維持)/EXIT(離脱)
+#       を判定し、切替時だけ通知する。スワップ狙いの買い持ちを大幅安から守る用途。
+#       3年実測で買い持ち比の最大DDを USD/JPY 55%・AUD/JPY 55%・NZD/JPY 57% 削減、
+#       通知は年1〜2回/ペア。判定は long_guard.py（SMAクロスのコアとは独立）。
+#   "sma_cross": 従来の 5分足 SMA50/100 クロスで LONG/SHORT を判定するドテン合図。
+#       3年実測でエッジがあるのは USD/JPY のみ（AUD/JPY ≈0、NZD/JPY は負）。
+STRATEGY = os.environ.get("STRATEGY", "long_guard").strip().lower() or "long_guard"
 INTERVAL = "5m"           # 足種（例: "5m", "15m", "1h", "1d"）
 # 取得期間。"1mo" にして上位足(4H)の本数を確保し、ライブのダウ判定を安定させる
 # （5d だと4H足が約30本でUNKNOWN多め）。SMA/ATR/STALE は末尾のみ参照のため影響なし。
@@ -103,9 +113,11 @@ def state_path(ticker: str) -> Path:
 # ─────────────────────────────────────────────────────────────
 # データ取得
 # ─────────────────────────────────────────────────────────────
-def fetch_data(ticker: str) -> pd.DataFrame:
+def fetch_data(ticker: str, interval: str | None = None, period: str | None = None) -> pd.DataFrame:
     """yfinance から価格データを取得し、列を平坦化して返す。
 
+    interval/period を省略すると本体既定（INTERVAL/PERIOD）。long_guard モードは
+    日足("1d"/"1y")を指定して呼ぶ。
     通信失敗・空応答・レート制限(429)時は指数バックオフで数回リトライする。
     最終的に失敗しても例外で落とさず、空の DataFrame を返して呼び出し側に
     「何もせず正常終了」させる（グレースフルデグレード）。
@@ -116,8 +128,8 @@ def fetch_data(ticker: str) -> pd.DataFrame:
         try:
             df = yf.download(
                 ticker,
-                interval=INTERVAL,
-                period=PERIOD,
+                interval=interval or INTERVAL,
+                period=period or PERIOD,
                 progress=False,
                 auto_adjust=True,
             )
@@ -290,6 +302,7 @@ def save_state(path: Path, info: dict) -> None:
         "state": info["state"],
         "price": info["price"],
         "time": info["time"],
+        "strategy": STRATEGY,
         "updated_at": datetime.now(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
     }
     path.write_text(
@@ -410,7 +423,11 @@ def process_pair(ticker: str) -> str:
 
     ペアごとに独立した state_<PAIR>.json で状態を管理する。
     1ペアの処理が例外を投げても、呼び出し側で他ペアは止めない。
+    STRATEGY="long_guard" の時は日足ロング保護の判定（_process_pair_guard）へ委譲する。
     """
+    if STRATEGY == "long_guard":
+        return _process_pair_guard(ticker)
+
     label = pair_label(ticker)
     decimals = pair_decimals(ticker)
     currencies = pair_currencies(ticker)
@@ -507,6 +524,68 @@ def process_pair(ticker: str) -> str:
         return "nochange"
 
 
+def _assess_risk_safely(info: dict, *, currencies, label: str) -> dict | None:
+    """リスク層を呼ぶ。何が起きても本体を止めず、失敗は status で可視化する。"""
+    try:
+        import risk_filter  # 遅延 import（付加層）
+        return risk_filter.assess_risk(info, currencies=currencies, pair_label=label)
+    except Exception as exc:  # noqa: BLE001 - 付加層の失敗で本体を止めない
+        print(f"[{label}] リスク層でエラー（リスク不明で続行）: {exc}", file=sys.stderr)
+        return {"status": "llm_failed", "risk_level": "unknown", "available": False}
+
+
+def _process_pair_guard(ticker: str) -> str:
+    """ロング保護モード（STRATEGY="long_guard"）の1ペア処理。
+
+    確定日足だけで HOLD/EXIT を判定し、切り替わった日に1回だけ通知する。
+    状態は 1日に最大1回しか変わらないので、cron が5分おきでも通知は増えない。
+    旧戦略の状態ファイル（LONG/SHORT）が残っていれば初回扱いで現在の状態を通知して上書きする。
+    返り値は process_pair と同じ種別（データ健全性チェックで共用）。
+    """
+    import long_guard as lg  # 遅延 import（付加層。読み込み失敗は呼び出し側の try で隔離）
+
+    label = pair_label(ticker)
+    decimals = pair_decimals(ticker)
+    currencies = pair_currencies(ticker)
+    path = state_path(ticker)
+
+    prev = load_state(path)
+    prev_state = lg.normalize_prev(prev.get("state") if prev else None)
+
+    df = fetch_data(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
+    if df is None or df.empty:
+        print(f"[{label}] 日足データ取得に失敗（空の応答）。")
+        return "fetch_failed"
+
+    info = lg.evaluate(df, prev_state=prev_state)
+    if info is None:
+        print(f"[{label}] 日足の本数不足/鮮度不良のため判定をスキップ。")
+        return "no_data"
+
+    if prev_state is None:
+        notify(lg.format_message(info, label=label, decimals=decimals, first_run=True))
+        save_state(path, info)
+        print(f"[{label}] ロング保護 初回起動: 状態を {info['state']} で保存しました。")
+        return "first_run"
+
+    if prev_state == info["state"]:
+        print(f"[{label}] ロング保護 状態変化なし: {info['state']}（通知スキップ）")
+        return "nochange"
+
+    # 切替時のみ: リスク層（経済イベント）を添えて通知する。ダウMTFゲートは5分足前提の
+    # 付加層なので日足判定には適用しない。
+    risk = _assess_risk_safely(info, currencies=currencies, label=label)
+    body = lg.format_message(info, label=label, decimals=decimals)
+    notify(_risk_prefix(risk) + body + _risk_footer(risk))
+    save_state(path, info)
+    print(
+        f"[{label}] ロング保護 状態変化: {prev_state} → {info['state']}"
+        f" / リスク: {risk.get('risk_level') if risk else 'unknown'}"
+        f" (status={risk.get('status') if risk else 'unknown'})"
+    )
+    return "changed"
+
+
 # ─────────────────────────────────────────────────────────────
 # データ源のサイレント故障検知（改善A）
 # ─────────────────────────────────────────────────────────────
@@ -574,13 +653,19 @@ def heartbeat() -> int:
     区別できない『古いまま固まる』故障（改善Aの空取得では拾えない）への週次バックストップ。
     取得失敗してもハートビート自体は送る（死活確認を優先）。
     """
-    lines = ["✅ FXシグナル監視は稼働中です（週次ハートビート）"]
+    mode = "ロング保護・日足" if STRATEGY == "long_guard" else "SMAクロス・5分足"
+    lines = [f"✅ FXシグナル監視は稼働中です（週次ハートビート / {mode}）"]
     ages: list[float | None] = []
     for ticker in PAIRS:
         label = pair_label(ticker)
         st = load_state(state_path(ticker))
         if st:
-            stance = "買い📈" if st.get("state") == "LONG" else "売り📉"
+            s = st.get("state")
+            if s in ("LONG", "SHORT"):
+                stance = "買い📈" if s == "LONG" else "売り📉"
+            else:
+                import long_guard as lg
+                stance = lg.stance_label(s)
             lines.append(
                 f"・{label}: 現在 {st.get('state')}（{stance}） / {st.get('updated_at', '?')} 時点"
             )

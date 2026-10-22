@@ -19,6 +19,11 @@
                        要 `pip install -r requirements-backtest.txt`。取得は重いので
                        .cache/ にCSVキャッシュして2回目以降は即時。
     例: python backtest.py --source dukascopy USDJPY=X 1y 5m
+
+ロング保護ガード（--guard）:
+    python backtest.py --guard 1y 1d                       # 日足で全ペア（買い持ちと比較）
+    python backtest.py --guard --source dukascopy 3y 5m    # 5分足→日足に集約して3年
+    python backtest.py --guard AUDJPY=X 1y 1d              # 単一ペアを切替履歴つきで
 """
 
 from __future__ import annotations
@@ -236,6 +241,107 @@ def _print_gate_comparison(df: pd.DataFrame, changes: list) -> None:
     print(f"     内訳: {detail}")
 
 
+# ─────────────────────────────────────────────────────────────
+# ロング保護ガード（long_guard.py）の損益評価: --guard
+# ─────────────────────────────────────────────────────────────
+def _to_daily(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """日中足なら UTC 日足にリサンプル。日足ならそのまま（index は naive 日付に正規化）。"""
+    d = df.copy()
+    idx = pd.to_datetime(d.index)
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    d.index = idx
+    if interval != "1d":
+        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+        cols = [c for c in agg if c in d.columns]
+        d = d[cols].resample("1D").agg({c: agg[c] for c in cols}).dropna(subset=["Close"])
+    d.index = d.index.normalize()
+    return d
+
+
+def _guard_pnl(daily: pd.DataFrame, in_market: pd.Series, spread_pips: float, pip: float):
+    """in_market[i]（i日の確定後に決まる）を i+1 日の Open で執行する、ロング専用の損益。
+
+    返り値: (トレード損益pips のリスト, 日次損益pips Series, 在場率)
+    """
+    o = daily["Open"].to_numpy(dtype=float)
+    c = daily["Close"].to_numpy(dtype=float)
+    im = in_market.shift(1).fillna(False).to_numpy(dtype=bool)  # 前日の判定を当日に適用
+    trades: list[float] = []
+    daily_pnl = pd.Series(0.0, index=daily.index)
+    pos = False
+    entry = None
+    for i in range(1, len(c)):
+        if im[i] != pos:
+            if im[i]:
+                pos, entry = True, o[i]
+            else:
+                trades.append((o[i] - entry) / pip - spread_pips)
+                pos, entry = False, None
+        if pos:
+            # 建てた日は Open→Close、以降は前日Close→当日Close
+            daily_pnl.iloc[i] = (c[i] - (o[i] if im[i] != im[i - 1] else c[i - 1])) / pip
+    if pos:
+        trades.append((c[-1] - entry) / pip - spread_pips)
+    return trades, daily_pnl, float(im.mean())
+
+
+def _max_dd(daily_pnl: pd.Series) -> float:
+    eq = daily_pnl.cumsum()
+    return float((eq.cummax() - eq).max())
+
+
+def backtest_guard(ticker: str, period: str, interval: str, detail: bool, source: str) -> int:
+    """long_guard.guard_states を過去データに流し、買い持ちとの比較を出す。"""
+    import long_guard as lg
+
+    label = fx.pair_label(ticker)
+    dec = fx.pair_decimals(ticker)
+    pip = 10 ** (-(dec - 1))  # JPYクロス(3桁)=0.01, それ以外(5桁)=0.0001
+    spread = {3: 0.5, 5: 1.0}.get(dec, 1.0)  # 往復スプレッドの保守的な想定(pips)
+    df = fetch_history(ticker, period, interval, source)
+    if df is None or df.empty or "Close" not in df.columns or "Open" not in df.columns:
+        print(f"[{label}] データを取得できませんでした（Open/Close が必要）。")
+        return 1
+    daily = _to_daily(df, interval)
+    if len(daily) < lg.GUARD_SMA_DAYS + 5:
+        print(f"[{label}] 日足本数不足: {len(daily)}本（SMA{lg.GUARD_SMA_DAYS} に届かず）")
+        return 1
+
+    st = lg.guard_states(daily["Close"])
+    hold = st == lg.STATE_HOLD
+    valid = st.notna()
+    # 比較対象の買い持ちは、ガードが判定可能になった日以降で揃える
+    bh_trades, bh_daily, _ = _guard_pnl(daily, valid, spread, pip)
+    g_trades, g_daily, in_rate = _guard_pnl(daily, hold & valid, spread, pip)
+    flips = st[valid][st[valid] != st[valid].shift()].iloc[1:]
+
+    print(
+        f"\n■ {label}  期間 {daily.index[0].date()}〜{daily.index[-1].date()} / 日足 {len(daily)}本"
+        f" / ガード: 日足SMA{lg.GUARD_SMA_DAYS}・帯±{lg.GUARD_BAND_PCT:g}% / スプレッド往復 {spread}pips"
+    )
+    print(
+        f"  買い持ち : 損益 {sum(bh_trades):>7.0f} pips / 最大DD {_max_dd(bh_daily):>6.0f} / 在場 100%"
+    )
+    print(
+        f"  ガード   : 損益 {sum(g_trades):>7.0f} pips / 最大DD {_max_dd(g_daily):>6.0f}"
+        f" / 在場 {100*in_rate:.0f}% / 往復 {len(g_trades)}回（切替 {len(flips)}回）"
+        f" / 現在 {st.iloc[-1]}（{lg.stance_label(st.iloc[-1])}）"
+    )
+    years = sorted(set(daily.index.year))
+    yr = "  ".join(
+        f"{y}: {g_daily[g_daily.index.year == y].sum():>5.0f}/{bh_daily[bh_daily.index.year == y].sum():>5.0f}"
+        for y in years
+    )
+    print(f"  年次 pips（ガード/買い持ち）: {yr}")
+    if detail and len(flips):
+        print("  ―― 切替履歴 ――")
+        for ts, s in flips.items():
+            arrow = "🛡️離脱" if s == lg.STATE_EXIT else "🟢復帰"
+            print(f"  {ts.date()}  → {s:<4} {arrow}  終値 {daily.loc[ts, 'Close']:.{dec}f}")
+    return 0
+
+
 def _jst(ts: pd.Timestamp) -> str:
     if isinstance(ts, pd.Timestamp):
         t = ts.tz_localize("UTC") if ts.tzinfo is None else ts
@@ -260,6 +366,7 @@ def main(argv: list[str]) -> int:
     args: list[str] = []
     source = "yfinance"
     gate = False
+    guard = False
     it = iter(argv)
     for a in it:
         if a == "--source":
@@ -268,6 +375,8 @@ def main(argv: list[str]) -> int:
             source = a.split("=", 1)[1]
         elif a == "--gate":  # MTFゲート有無の比較出力を追加
             gate = True
+        elif a == "--guard":  # ロング保護ガード（long_guard.py）の損益評価
+            guard = True
         else:
             args.append(a)
 
@@ -278,10 +387,13 @@ def main(argv: list[str]) -> int:
     tickers = [single] if single else fx.PAIRS
     print(f"バックテスト: {', '.join(fx.pair_label(t) for t in tickers)}"
           f"  / source={source} / period={period} / interval={interval}"
-          f"{' / gate比較' if gate else ''}")
+          f"{' / gate比較' if gate else ''}{' / ロング保護ガード' if guard else ''}")
     rc = 0
     for t in tickers:
         try:
+            if guard:
+                rc |= backtest_guard(t, period, interval, detail=bool(single), source=source)
+                continue
             rc |= backtest_pair(
                 t, period, interval, detail=bool(single), source=source, gate=gate
             )

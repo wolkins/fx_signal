@@ -516,6 +516,136 @@ def test_determinism_backtest_matches_evaluate():
 
 
 # ─────────────────────────────────────────────────────────────
+# ロング保護ガード（long_guard.py / STRATEGY="long_guard"）
+# ─────────────────────────────────────────────────────────────
+import long_guard as lg  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+
+
+def _daily_df(closes, start="2025-01-01"):
+    idx = pd.date_range(start, periods=len(closes), freq="D")
+    c = pd.Series(closes, index=idx, dtype=float)
+    return pd.DataFrame({"Open": c, "High": c + 0.1, "Low": c - 0.1, "Close": c})
+
+
+def test_guard_drops_unconfirmed_today_bar():
+    df = _daily_df([100.0] * 60, start="2025-01-01")
+    last = df.index[-1]  # 2025-03-01
+    # 「今日」が最終バーの日付なら、そのバーは進行中として落とされる
+    s = lg.confirmed_daily_close(df, now_utc=datetime(2025, 3, 1, 12, tzinfo=timezone.utc))
+    assert s.index[-1] == last - pd.Timedelta(days=1)
+    # 翌日になれば採用される
+    s2 = lg.confirmed_daily_close(df, now_utc=datetime(2025, 3, 2, 0, 5, tzinfo=timezone.utc))
+    assert s2.index[-1] == last
+    # tz-aware index でも同じ日付に正規化される
+    dft = df.copy()
+    dft.index = dft.index.tz_localize("UTC")
+    s3 = lg.confirmed_daily_close(dft, now_utc=datetime(2025, 3, 2, tzinfo=timezone.utc))
+    assert s3.index[-1] == last and s3.index.tz is None
+
+
+def test_guard_band_hysteresis():
+    # SMA=100 相当の平坦な系列。帯1%: 99.5 では HOLD 維持、98.9 で EXIT。
+    assert lg.next_state(99.5, 100.0, lg.STATE_HOLD, 1.0) == lg.STATE_HOLD
+    assert lg.next_state(98.9, 100.0, lg.STATE_HOLD, 1.0) == lg.STATE_EXIT
+    # EXIT 中: 100.5 では EXIT 維持、101.1 で HOLD 復帰
+    assert lg.next_state(100.5, 100.0, lg.STATE_EXIT, 1.0) == lg.STATE_EXIT
+    assert lg.next_state(101.1, 100.0, lg.STATE_EXIT, 1.0) == lg.STATE_HOLD
+    # 初期化は単純比較
+    assert lg.next_state(100.01, 100.0, None, 1.0) == lg.STATE_HOLD
+    assert lg.next_state(99.99, 100.0, None, 1.0) == lg.STATE_EXIT
+    # 帯0なら単純クロス
+    assert lg.next_state(99.99, 100.0, lg.STATE_HOLD, 0.0) == lg.STATE_EXIT
+
+
+def test_guard_states_matches_sequential_evaluate():
+    # ランダムウォーク風の決定論的系列で、一括(guard_states)と逐次(evaluate)が一致すること
+    import math as _m
+    closes = [100.0]
+    for i in range(1, 200):
+        closes.append(closes[-1] * (1 + 0.012 * _m.sin(i / 7.0) + 0.004 * _m.cos(i / 3.0)))
+    df = _daily_df(closes, start="2024-01-01")
+    now = datetime(2024, 12, 31, tzinfo=timezone.utc)  # 全バーが確定済み扱い
+    states = lg.guard_states(lg.confirmed_daily_close(df, now))
+    valid = states.dropna()
+    assert len(valid) > 100 and set(valid.unique()) == {lg.STATE_HOLD, lg.STATE_EXIT}, "切替が発生する系列であること"
+    prev = None
+    mism = 0
+    for ts, st in valid.items():
+        # 逐次評価は「その翌日に実行された」想定（鮮度ガードに掛からないよう now を揃える）
+        nxt = (ts + pd.Timedelta(days=1)).to_pydatetime().replace(tzinfo=timezone.utc)
+        ev = lg.evaluate(df.loc[:ts], prev_state=prev, now_utc=nxt)
+        if ev is None or ev["state"] != st:
+            mism += 1
+        prev = st
+    assert mism == 0, f"{mism}日で不一致"
+
+
+def test_guard_evaluate_guards_and_legacy_prev():
+    df = _daily_df([100.0] * 30, start="2025-01-01")  # SMA50 に届かない
+    assert lg.evaluate(df, now_utc=datetime(2025, 3, 1, tzinfo=timezone.utc)) is None
+    df2 = _daily_df([100.0] * 60, start="2025-01-01")
+    # 最新確定足が GUARD_STALE_DAYS より古ければ None
+    assert lg.evaluate(df2, now_utc=datetime(2025, 3, 20, tzinfo=timezone.utc)) is None
+    # 旧戦略の状態(LONG/SHORT)は None に正規化＝初回扱い
+    assert lg.normalize_prev("LONG") is None and lg.normalize_prev("HOLD") == "HOLD"
+    info = lg.evaluate(df2, prev_state="LONG", now_utc=datetime(2025, 3, 2, tzinfo=timezone.utc))
+    assert info is not None and info["state"] in lg.STATES
+    assert "確定日足" in info["time"]
+    # リスク層が参照するキーが存在する
+    assert "change_15m_pct" in info and "change_1h_pct" in info
+
+
+def test_guard_message_format():
+    info = {"state": lg.STATE_EXIT, "price": 98.5, "sma": 100.0, "band_lo": 99.0,
+            "band_hi": 101.0, "dist_pct": -1.5, "time": "2025-03-01 確定日足"}
+    m = lg.format_message(info, label="AUD/JPY")
+    assert "離脱" in m and "下抜け" in m and "AUD/JPY" in m and "99.000" in m
+    info["state"] = lg.STATE_HOLD
+    m2 = lg.format_message(info, label="AUD/JPY")
+    assert "復帰" in m2 and "上抜け" in m2
+    m3 = lg.format_message(info, label="AUD/JPY", first_run=True)
+    assert "監視を開始" in m3 and "HOLD" in m3
+    # ハートビート表示
+    assert lg.stance_label("HOLD") != lg.stance_label("EXIT") != lg.stance_label(None)
+
+
+def test_guard_backtest_consistent_with_module():
+    # backtest.backtest_guard が long_guard の判定をそのまま使い、落ちずに走ること
+    import math as _m
+    closes = [100.0]
+    for i in range(1, 160):
+        closes.append(closes[-1] * (1 + 0.01 * _m.sin(i / 9.0)))
+    df = _daily_df(closes, start="2024-01-01")
+    with patched(bt, fetch_history=lambda t, p, i, s: df):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = bt.backtest_guard("AUDJPY=X", "1y", "1d", detail=True, source="x")
+    out = buf.getvalue()
+    assert rc == 0 and "買い持ち" in out and "ガード" in out and "切替履歴" in out
+
+
+def test_strategy_default_and_env_override():
+    import importlib
+    import os as _os
+    saved = _os.environ.get("STRATEGY")
+    try:
+        _os.environ.pop("STRATEGY", None)
+        importlib.reload(fx)
+        assert fx.STRATEGY == "long_guard"
+        _os.environ["STRATEGY"] = "SMA_CROSS"
+        importlib.reload(fx)
+        assert fx.STRATEGY == "sma_cross"
+    finally:
+        if saved is None:
+            _os.environ.pop("STRATEGY", None)
+        else:
+            _os.environ["STRATEGY"] = saved
+        importlib.reload(fx)
+        fx.HEALTH_FILE = Path(tempfile.gettempdir()) / "fx_signal_test_health.json"
+
+
+# ─────────────────────────────────────────────────────────────
 # プレーン実行用ランナー（pytest 不要）
 # ─────────────────────────────────────────────────────────────
 def _run_all() -> int:

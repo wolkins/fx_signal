@@ -7,7 +7,11 @@
 
 # 本体監視: 5分おき。市場クローズ中は STALE_MINUTES ガードが自動スキップするので
 # 毎時実行で安全。GitHub と違いスロットルされず正確に動く。
-*/5 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
+# ※ 既定の long_guard（日足）モードでは状態は1日1回しか変わらないので、5分おきは不要。
+#   日足が確定する 00:00 UTC（09:00 JST）以降に1時間おき程度で十分（Yahoo への負荷も減る）。
+#   sma_cross（5分足）モードに戻す時だけ */5 にする。
+15 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
+# */5 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
 
 # 週次ハートビート（死活確認）。下は「火曜08:00」をサーバTZがJSTの場合の例。
 # サーバがUTCなら "0 23 * * 1"（月23:00 UTC = 火08:00 JST）にする。
