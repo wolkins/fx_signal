@@ -15,4 +15,7 @@
 
 # 週次ハートビート（死活確認）。下は「火曜08:00」をサーバTZがJSTの場合の例。
 # サーバがUTCなら "0 23 * * 1"（月23:00 UTC = 火08:00 JST）にする。
+# ※ 既定の long_guard（日足）では鮮度を「確定日足が5日より古いか」で見るので、
+#   週末や祝日に動かしても誤検知しない（時刻は任意）。sma_cross（5分足）では
+#   市場オープン中の時刻にすること。
 0 8 * * 2 /home/USER/fx_signal/deploy/run.sh --heartbeat >> /home/USER/fx_signal/cron.log 2>&1

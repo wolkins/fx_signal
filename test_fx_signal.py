@@ -395,7 +395,7 @@ def test_heartbeat_message():
     sent: list[str] = []
     with patched(fx, PAIRS=["USDJPY=X"],
                  load_state=lambda p: {"state": "LONG", "updated_at": "2026-05-30 08:00 JST"},
-                 fetch_data=lambda t: None,  # 鮮度チェックはスキップ（取得しない）
+                 fetch_data=lambda t, **k: None,  # 鮮度チェックはスキップ（取得しない）
                  notify=sent.append):
         fx.heartbeat()
     assert sent and "稼働中" in sent[0] and "USD/JPY" in sent[0] and "LONG" in sent[0]
@@ -403,18 +403,54 @@ def test_heartbeat_message():
 
 
 def test_heartbeat_stale_feed_warns():
+    """5分足モード(sma_cross): 最新足が STALE_MINUTES より古ければ警告。"""
     import pandas as pd
     sent: list[str] = []
     # 最新足が STALE_MINUTES より十分古い df を返す
     old = pd.date_range(end=pd.Timestamp("2026-05-26 00:00", tz="UTC"), periods=3, freq="5min")
     stale_df = pd.DataFrame({"Close": [1.0, 2.0, 3.0]}, index=old)
-    with patched(fx, PAIRS=["USDJPY=X"],
+    with patched(fx, PAIRS=["USDJPY=X"], STRATEGY="sma_cross",
                  load_state=lambda p: {"state": "LONG", "updated_at": "x"},
-                 fetch_data=lambda t: stale_df,
+                 fetch_data=lambda t, **k: stale_df,
                  STALE_MINUTES=90,
                  notify=sent.append):
         fx.heartbeat()
     assert "古い" in sent[0]  # 全ペア古い → 固まり疑いの警告
+
+
+def test_heartbeat_daily_mode_uses_confirmed_daily_age():
+    """日足モード(long_guard): 鮮度は「最新の確定日足が GUARD_STALE_DAYS より古いか」で判定。
+    週末（金曜足が最新・日曜深夜に実行）では警告せず、数週間止まっていれば警告する。"""
+    import pandas as pd
+    import long_guard as lg
+
+    def run(last_day: str, now: datetime) -> str:
+        sent: list[str] = []
+        idx = pd.date_range(end=pd.Timestamp(last_day), periods=10, freq="B")
+        df = pd.DataFrame({"Close": range(10)}, index=idx)
+        calls: list[dict] = []
+
+        def fetch(t, **k):
+            calls.append(k)
+            return df
+
+        # 「今」を固定するため、_latest_age_days に now_utc を注入する薄い wrapper で検証
+        orig = fx._latest_age_days
+        with patched(fx, PAIRS=["USDJPY=X", "AUDJPY=X"], STRATEGY="long_guard",
+                     load_state=lambda p: {"state": "HOLD", "guard": "sma", "updated_at": "x"},
+                     fetch_data=fetch, notify=sent.append,
+                     _latest_age_days=lambda d, now_utc=None: orig(d, now)):
+            fx.heartbeat()
+        # 日足モードでは日足("1d")を取得している
+        assert calls and all(k.get("interval") == lg.GUARD_INTERVAL for k in calls)
+        return sent[0]
+
+    # 金曜 2026-10-23 が最新確定足、日曜深夜(JST 月曜 02:30 = 日曜 17:30 UTC) → 2日古いだけ。警告なし
+    m = run("2026-10-23", datetime(2026, 10, 25, 17, 30, tzinfo=timezone.utc))
+    assert "ロング保護・日足" in m and "古い" not in m
+    # 最新確定足が 2 週間以上前 → 警告
+    m = run("2026-10-09", datetime(2026, 10, 25, 17, 30, tzinfo=timezone.utc))
+    assert "確定日足が" in m and "古い" in m
 
 
 # ─────────────────────────────────────────────────────────────

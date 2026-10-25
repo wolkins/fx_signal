@@ -14,7 +14,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -678,17 +678,38 @@ def _latest_age_min(df: pd.DataFrame) -> float | None:
     return (datetime.now(TOKYO) - ts.tz_convert(TOKYO)).total_seconds() / 60.0
 
 
+def _latest_age_days(df: pd.DataFrame, now_utc: datetime | None = None) -> float | None:
+    """最新の **確定日足** が何日前か（日足モードの鮮度チェック用）。取得できなければ None。
+
+    本体の長期ガード判定と同じ confirmed_daily_close を使うので、当日の進行中バーは数えない。
+    週末・祝日は確定足が 1〜3 日古くなるだけなので、GUARD_STALE_DAYS(5) を超えない。
+    """
+    import long_guard as lg
+    close = lg.confirmed_daily_close(df, now_utc)
+    if close.empty:
+        return None
+    now = now_utc or datetime.now(timezone.utc)
+    return float((pd.Timestamp(now.date()) - close.index[-1]).days)
+
+
 def heartbeat() -> int:
     """週次ハートビート: 「稼働中」＋各ペアの現在状態＋データ鮮度を1回通知する（改善B）。
 
-    実行時刻（cronで火曜08:00 JSTなど確実に市場オープン中）に**全ペアの最新足が古い**
-    なら「データ源が固まっている可能性」を添える。これは process_pair 側では市場クローズと
-    区別できない『古いまま固まる』故障（改善Aの空取得では拾えない）への週次バックストップ。
-    取得失敗してもハートビート自体は送る（死活確認を優先）。
+    **全ペアの最新足が古い**なら「データ源が固まっている可能性」を添える。これは process_pair
+    側では市場クローズと区別できない『古いまま固まる』故障（改善Aの空取得では拾えない）への
+    週次バックストップ。取得失敗してもハートビート自体は送る（死活確認を優先）。
+
+    鮮度の基準は判定モードに合わせる:
+      - long_guard（日足）: 最新の確定日足が GUARD_STALE_DAYS(5) 日より古いか。週末・祝日に
+        実行しても誤検知しない（cron の時刻に依存しない）。
+      - sma_cross（5分足）: 最新足が STALE_MINUTES より古いか。市場オープン中
+        （cron で火曜08:00 JST など）に実行する前提。
     """
-    mode = "ロング保護・日足" if STRATEGY == "long_guard" else "SMAクロス・5分足"
+    daily = STRATEGY == "long_guard"
+    mode = "ロング保護・日足" if daily else "SMAクロス・5分足"
     lines = [f"✅ FXシグナル監視は稼働中です（週次ハートビート / {mode}）"]
-    ages: list[float | None] = []
+    stale: list[bool | None] = []   # ペアごとの「古い」判定。取得できなければ None
+    stale_days = 0
     for ticker in PAIRS:
         label = pair_label(ticker)
         st = load_state(state_path(ticker))
@@ -707,17 +728,31 @@ def heartbeat() -> int:
         else:
             lines.append(f"・{label}: 状態未確定（次のオープンで初期化されます）")
         try:
-            ages.append(_latest_age_min(fetch_data(ticker)))
+            if daily:
+                lg = guard_module(guard_engine(ticker))
+                stale_days = lg.GUARD_STALE_DAYS
+                age = _latest_age_days(
+                    fetch_data(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
+                )
+                stale.append(None if age is None else age > stale_days)
+            else:
+                age = _latest_age_min(fetch_data(ticker))
+                stale.append(None if age is None else age > STALE_MINUTES)
         except Exception:  # noqa: BLE001 - 鮮度チェックの失敗で死活通知は止めない
-            ages.append(None)
+            stale.append(None)
 
-    # この時刻は市場オープン中の想定。全ペアでデータがある（None でない）のに
-    # すべて古い場合のみ「固まり」を疑う（市場クローズの祝日等は誤検知しにくい時刻設定）。
-    known = [a for a in ages if a is not None]
-    if known and all(a > STALE_MINUTES for a in known):
-        lines.append(
-            "⚠️ ただし全ペアで最新足が古いです。データ源が止まっている可能性があります。"
-        )
+    # 全ペアでデータがある（None でない）のにすべて古い場合のみ「固まり」を疑う。
+    known = [a for a in stale if a is not None]
+    if known and all(known):
+        if daily:
+            lines.append(
+                f"⚠️ ただし全ペアで最新の確定日足が {stale_days}日より古いです。"
+                "データ源が止まっている可能性があります。"
+            )
+        else:
+            lines.append(
+                "⚠️ ただし全ペアで最新足が古いです。データ源が止まっている可能性があります。"
+            )
     notify("\n".join(lines))
     print("ハートビートを送信しました。")
     return 0
