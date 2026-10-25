@@ -143,7 +143,9 @@ def fetch_data(ticker: str, interval: str | None = None, period: str | None = No
     """yfinance から価格データを取得し、列を平坦化して返す。
 
     interval/period を省略すると本体既定（INTERVAL/PERIOD）。long_guard モードは
-    日足（各エンジンの GUARD_INTERVAL/GUARD_PERIOD）を指定して呼ぶ。
+    fetch_daily_ohlc() 経由で 1時間足を取得し UTC 日足にまとめて使う。
+    ※ yfinance の interval="1d" は FX（=X）では **Close が前日の終値（その日 00:00 UTC の値）**
+      になっており日足判定に使えない（High/Low は正しい）。Dukascopy 5分足との比較で確認済み。
     通信失敗・空応答・レート制限(429)時は指数バックオフで数回リトライする。
     最終的に失敗しても例外で落とさず、空の DataFrame を返して呼び出し側に
     「何もせず正常終了」させる（グレースフルデグレード）。
@@ -182,6 +184,35 @@ def fetch_data(ticker: str, interval: str | None = None, period: str | None = No
 # ─────────────────────────────────────────────────────────────
 # 指標計算
 # ─────────────────────────────────────────────────────────────
+def to_daily_utc(df: pd.DataFrame) -> pd.DataFrame:
+    """日中足（1h/5m など）を **UTC 日足** の OHLC にまとめる（index は naive の日付）。
+
+    - 日の境界は 00:00 UTC。終値はその日の最後の足の Close（金曜は 21〜22時 UTC 頃）。
+    - 日曜の短い端数セッション（21:00 UTC〜）は捨てる。yfinance は日曜足を週によって
+      返したり返さなかったりするので、含めると日足の本数（SMA 窓・ダウの波の本数）がぶれる。
+      backtest.py の Dukascopy 5分足→日足も同じ関数を使うので、検証と本番が一致する。
+    """
+    cols = [c for c in ("Open", "High", "Low", "Close") if c in df.columns]
+    if df is None or df.empty or "Close" not in cols:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close"])
+    d = df[cols].copy()
+    idx = pd.to_datetime(d.index)
+    idx = idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None else idx
+    d.index = idx
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
+    out = d.resample("1D").agg({c: agg[c] for c in cols}).dropna(subset=["Close"])
+    out.index = out.index.normalize()
+    return out[out.index.dayofweek != 6]
+
+
+def fetch_daily_ohlc(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    """ロング保護用の日足 OHLC。interval が日中足なら取得後に to_daily_utc でまとめる。"""
+    df = fetch_data(ticker, interval=interval, period=period)
+    if df is None or df.empty:
+        return df
+    return df if interval == "1d" else to_daily_utc(df)
+
+
 def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> float | None:
     """RSI(14) を計算して最新値を返す。計算不能なら None。"""
     if len(close) < period + 1:
@@ -584,7 +615,7 @@ def _process_pair_guard(ticker: str) -> str:
     if prev and prev.get("guard", "sma") == engine:  # 別エンジンの状態は引き継がない
         prev_state = lg.normalize_prev(prev.get("state"))
 
-    df = fetch_data(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
+    df = fetch_daily_ohlc(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
     if df is None or df.empty:
         print(f"[{label}] 日足データ取得に失敗（空の応答）。")
         return "fetch_failed"
@@ -732,7 +763,7 @@ def heartbeat() -> int:
                 lg = guard_module(guard_engine(ticker))
                 stale_days = lg.GUARD_STALE_DAYS
                 age = _latest_age_days(
-                    fetch_data(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
+                    fetch_daily_ohlc(ticker, interval=lg.GUARD_INTERVAL, period=lg.GUARD_PERIOD)
                 )
                 stale.append(None if age is None else age > stale_days)
             else:

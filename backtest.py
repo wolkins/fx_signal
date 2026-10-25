@@ -246,17 +246,15 @@ def _print_gate_comparison(df: pd.DataFrame, changes: list) -> None:
 # ロング保護ガード（long_guard.py）の損益評価: --guard
 # ─────────────────────────────────────────────────────────────
 def _to_daily(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    """日中足なら UTC 日足にリサンプル。日足ならそのまま（index は naive 日付に正規化）。"""
+    """日中足なら本番と同じ fx.to_daily_utc で UTC 日足に（日曜の端数は除外）。
+    日足ならそのまま（index は naive 日付に正規化）。"""
+    if interval != "1d":
+        return fx.to_daily_utc(df)
     d = df.copy()
     idx = pd.to_datetime(d.index)
     if idx.tz is not None:
         idx = idx.tz_convert("UTC").tz_localize(None)
-    d.index = idx
-    if interval != "1d":
-        agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last"}
-        cols = [c for c in agg if c in d.columns]
-        d = d[cols].resample("1D").agg({c: agg[c] for c in cols}).dropna(subset=["Close"])
-    d.index = d.index.normalize()
+    d.index = idx.normalize()
     return d
 
 
@@ -305,6 +303,11 @@ def backtest_guard(ticker: str, period: str, interval: str, detail: bool, source
     dec = fx.pair_decimals(ticker)
     pip = 10 ** (-(dec - 1))  # JPYクロス(3桁)=0.01, それ以外(5桁)=0.0001
     spread = {3: 0.5, 5: 1.0}.get(dec, 1.0)  # 往復スプレッドの保守的な想定(pips)
+    if source == "yfinance" and interval == "1d":
+        # yfinance の FX 日足は Close が前日終値（00:00 UTC の値）で使えない。本番と同じく
+        # 1時間足を UTC 日足にまとめる（yfinance の 1h は約2年ぶんまで）。
+        print(f"[{label}] yfinance の 1d は FX の終値が前日値になるため、1h→UTC日足に切り替えます。")
+        interval = "1h"
     df = fetch_history(ticker, period, interval, source)
     if df is None or df.empty or "Close" not in df.columns or "Open" not in df.columns:
         print(f"[{label}] データを取得できませんでした（Open/Close が必要）。")

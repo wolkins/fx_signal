@@ -20,14 +20,19 @@ fx_signal.py はペアごとにどちらのエンジンを使うかを GUARD_BY_
   - 調整期間（レンジ）: 崩れない限り保有。分割決済（半分）は通知文の目安として添えるだけ。
   - 環境足: 本体では使わない（3年検証で週足環境足は日足単体と結果が同じだったため）。
 
-較正（ロング専用・翌日始値で執行・往復0.5pips控除。python backtest.py --guard --engine both）:
-  3年 Dukascopy 2023-06〜2026-06: USD/JPY +2643/DD1813, AUD/JPY +2462/DD1260, NZD/JPY +992/DD674
-    （買い持ち +1705/2081, +1955/2228, +612/1842。SMA50帯2%: +1864/942, +2385/1007, +454/793）
-  直近2年 yfinance 2024-10〜2026-10: USD/JPY -885/1349（SMA -240/946 の方が良い）,
-    AUD/JPY +1610/447（SMA +1567/453 と同等）, NZD/JPY +208/496（SMA -611/1066 より明確に良い）
-  WAVE_RULE="hill"（短い戻りの山も数える）だと 3年で NZD/JPY -76/1348、AUD/JPY 1679/1562 に悪化し、
-  ふた山・週足環境・SMA環境を足しても両期間で SMA を安定して上回らなかった（WAVE_RULE の注記参照）。
-  → 既定の割り当ては USD/JPY=SMA, AUD/JPY・NZD/JPY=ダウ（fx_signal.GUARD_BY_PAIR）。
+較正（2026-10-26 更新。ロング専用・翌日始値で執行・往復0.5pips控除・UTC 日足・日曜端数除外。
+python backtest.py --guard --engine both）:
+  3年 Dukascopy 2023-06〜2026-06: USD/JPY +2132/DD1360, AUD/JPY +2637/DD1311, NZD/JPY -228/DD1764
+    （買い持ち +1516/2081, +2008/2228, +722/1842。SMA50帯2%: +1230/974, +2273/1102, +168/968）
+  直近2年 yfinance 1h→日足 2024-10〜2026-10: USD/JPY -350/1365, AUD/JPY +986/1542, NZD/JPY -226/1181
+    （SMA: -336/980, +1654/419, -662/1099。買い持ち: -46/1735, +1295/1183, +140/873）
+  → NZD/JPY（両期間）と AUD/JPY（直近2年）で最大DDを買い持ちから減らせておらず、保護の目的を
+    満たさない。日曜の端数足を日足に含めるかどうかで NZD/JPY 3年が +992/674 ⇔ -228/1764 と
+    符号ごと変わるほど日足の作り方に敏感で、頑健とは言えない。
+  ※ それ以前の較正（AUD/NZD でダウが優位）は yfinance 日足の Close 不具合（前日終値）と日曜端数足を
+    含んでおり無効。既定割り当て AUD/JPY・NZD/JPY=ダウ は SMA へ戻すことを推奨（README 参照）。
+  WAVE_RULE="hill"（短い戻りの山も数える）やふた山・週足環境・SMA環境の併用も、旧データで SMA を
+  安定して上回らなかった（WAVE_RULE の注記参照）。
   本のデイトレ構成（4H環境足・15分足判定）は3年で往復370回超＝スワップ保有には不適。
   MIN_WAVE を 0 にする（大きく数えない）と NZD/JPY は 3年で -632 に崩れる。
 """
@@ -52,7 +57,8 @@ MIN_WAVE = 6              # 「6本のタメ」の本数（下の WAVE_RULE で�
 #           3年＋直近2年の較正では NZD/JPY が崩れ、SMA50帯2% を安定して上回らなかった。
 WAVE_RULE = "leg"
 DOUBLE_BOTTOM = False     # True: 崩れ後の復帰に2番底（谷2つ）を要求する（本の「ふた山」）
-GUARD_INTERVAL = "1d"     # yfinance の足種
+GUARD_INTERVAL = "1h"     # 取得する元足。fx_signal.to_daily_utc で UTC 日足にまとめる
+                          # （yfinance の "1d" は Close が前日終値になっており使えない）
 GUARD_PERIOD = "2y"       # 状態機械の初期化に十分な履歴（最初の明確な高値超え/安値割れが要る）
 GUARD_STALE_DAYS = 5      # 最新確定足がこれより古ければスキップ（長期休場/データ源異常）
 MIN_BARS = 60             # これ未満の日足本数では判定しない
@@ -69,7 +75,7 @@ ENGINE = "dow"
 def confirmed_daily_ohlc(df: pd.DataFrame, now_utc: datetime | None = None) -> pd.DataFrame:
     """日足 DataFrame から「確定済み」の OHLC を返す（index は naive の日付）。
 
-    yfinance の 1d は当日分を進行中バーとして含むため、日付が今日(UTC)より前のバーだけを採用。
+    当日分は進行中バーなので、日付が今日(UTC)より前のバーだけを採用。
     """
     cols = ["Open", "High", "Low", "Close"]
     if df is None or df.empty or any(c not in df.columns for c in cols):

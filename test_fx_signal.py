@@ -657,6 +657,47 @@ def test_guard_states_matches_sequential_evaluate():
     assert mism == 0, f"{mism}日で不一致"
 
 
+def test_to_daily_utc_boundary_and_sunday_drop():
+    """1時間足→UTC日足: 境界は 00:00 UTC、終値はその日の最後の足、日曜の端数セッションは捨てる。
+    yfinance と同じく Europe/London の tz-aware index で与える。"""
+    # 2026-10-23(金) 00:00Z 〜 2026-10-26(月) 23:00Z、ただし土曜なし・日曜は 21-23Z の3本だけ
+    idx = pd.date_range("2026-10-23 00:00", "2026-10-26 23:00", freq="1h", tz="UTC")
+    idx = idx[(idx.dayofweek != 5) & ((idx.dayofweek != 6) | (idx.hour >= 21))]
+    n = len(idx)
+    df = pd.DataFrame({"Open": range(n), "High": [v + 0.5 for v in range(n)],
+                       "Low": [v - 0.5 for v in range(n)], "Close": [v + 0.25 for v in range(n)]},
+                      index=idx.tz_convert("Europe/London"))
+    d = fx.to_daily_utc(df)
+    assert list(d.index.strftime("%Y-%m-%d")) == ["2026-10-23", "2026-10-26"]  # 日曜なし
+    assert d.index.tz is None
+    fri = df[df.index.tz_convert("UTC").strftime("%Y-%m-%d") == "2026-10-23"]
+    assert d.loc["2026-10-23", "Close"] == fri["Close"].iloc[-1]   # 金曜 23:00Z の足の Close
+    assert d.loc["2026-10-23", "Open"] == fri["Open"].iloc[0]      # 金曜 00:00Z の足の Open
+    assert d.loc["2026-10-23", "High"] == fri["High"].max() and d.loc["2026-10-23", "Low"] == fri["Low"].min()
+    # 月曜の終値は月曜 23:00Z の足（日曜 21-23Z は含めない）
+    mon = df[df.index.tz_convert("UTC").strftime("%Y-%m-%d") == "2026-10-26"]
+    assert d.loc["2026-10-26", "Open"] == mon["Open"].iloc[0]
+
+
+def test_fetch_daily_ohlc_resamples_intraday_and_passes_1d_through():
+    idx = pd.date_range("2026-10-19 00:00", "2026-10-23 23:00", freq="1h", tz="UTC")
+    hourly = pd.DataFrame({"Open": 1.0, "High": 2.0, "Low": 0.5, "Close": 1.5}, index=idx)
+    calls: list[dict] = []
+
+    def fake_fetch(t, interval=None, period=None):
+        calls.append({"interval": interval, "period": period})
+        return hourly
+
+    with patched(fx, fetch_data=fake_fetch):
+        d = fx.fetch_daily_ohlc("AUDJPY=X", interval="1h", period="2y")
+        assert len(d) == 5 and d.index.tz is None and calls[-1] == {"interval": "1h", "period": "2y"}
+        d1 = fx.fetch_daily_ohlc("AUDJPY=X", interval="1d", period="2y")
+        assert d1 is hourly  # 1d はそのまま返す（互換）
+    # 両エンジンとも元足は 1h（yfinance の 1d は FX の Close が前日値になるため）
+    import dow_guard as dg
+    assert lg.GUARD_INTERVAL == "1h" and dg.GUARD_INTERVAL == "1h"
+
+
 def test_guard_evaluate_derives_state_from_history_not_prev():
     """evaluate は履歴全体に規則を通して状態を求め、prev_state や単純比較に依存しない。
     （state ファイル削除や初回起動で、帯を無視した判定が混ざらないこと）"""
