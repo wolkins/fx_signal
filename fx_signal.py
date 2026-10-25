@@ -143,7 +143,7 @@ def fetch_data(ticker: str, interval: str | None = None, period: str | None = No
     """yfinance から価格データを取得し、列を平坦化して返す。
 
     interval/period を省略すると本体既定（INTERVAL/PERIOD）。long_guard モードは
-    日足("1d"/"1y")を指定して呼ぶ。
+    日足（各エンジンの GUARD_INTERVAL/GUARD_PERIOD）を指定して呼ぶ。
     通信失敗・空応答・レート制限(429)時は指数バックオフで数回リトライする。
     最終的に失敗しても例外で落とさず、空の DataFrame を返して呼び出し側に
     「何もせず正常終了」させる（グレースフルデグレード）。

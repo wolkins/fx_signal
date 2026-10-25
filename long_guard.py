@@ -10,7 +10,12 @@
   - HOLD 中に C < SMA × (1 − 帯%) となったら EXIT（離脱）。
   - EXIT 中に C > SMA × (1 + 帯%) となったら HOLD（復帰）。
   - 帯の内側では前回状態を維持する（日足レベルのだまし防止）。
-  - 初期状態（前回なし）は C > SMA なら HOLD、そうでなければ EXIT。
+  - 現在の状態は **取得した履歴全体（GUARD_PERIOD）に上の規則を通して** 求める。
+    保存済みの前回状態は「最後に何を通知したか」の記録であり、判定には使わない。
+    これにより state ファイルの削除・初回起動・エンジン切替でも、帯を無視した
+    単純比較（終値 vs SMA）で状態が決まることはなく、backtest.py の結果と常に一致する。
+    履歴の先頭（SMA が揃った最初の日）だけは単純比較で初期化するが、2年分の履歴で
+    帯の抜けが一度でもあれば末尾の状態はそこに依存しない。
   - 当日（進行中）の日足は使わない。日付が「今日(UTC)より前」のバーのみ確定とみなす。
 
 較正（Dukascopy 5分足→日足 3年 2023-06〜2026-06 ＋ yfinance 日足 直近2年 2024-10〜2026-10、
@@ -36,7 +41,7 @@ import pandas as pd
 GUARD_SMA_DAYS = 50       # 日足 SMA の本数
 GUARD_BAND_PCT = 2.0      # ヒステリシス帯（SMA に対する%）。0 で単純クロス
 GUARD_INTERVAL = "1d"     # yfinance の足種
-GUARD_PERIOD = "1y"       # 取得期間（SMA50 + 余裕。祝日欠損を考慮）
+GUARD_PERIOD = "2y"       # 取得期間。履歴に規則を通して状態を求めるので、収束に十分な長さ
 GUARD_STALE_DAYS = 5      # 最新確定足がこれより古ければデータ源異常/長期休場としてスキップ
 
 STATE_HOLD = "HOLD"       # ロング維持
@@ -117,7 +122,11 @@ def normalize_prev(prev_state: str | None) -> str | None:
 
 def evaluate(df: pd.DataFrame, prev_state: str | None = None,
              now_utc: datetime | None = None) -> dict | None:
-    """日足 DataFrame から HOLD/EXIT を判定する。データ不足・鮮度不良なら None。"""
+    """日足 DataFrame から HOLD/EXIT を判定する。データ不足・鮮度不良なら None。
+
+    状態は履歴全体に guard_states を通して求める。prev_state は互換のため受け取るが
+    判定には使わない（本体側で「通知済み状態との差」を見るためのもの）。
+    """
     close = confirmed_daily_close(df, now_utc)
     if len(close) < GUARD_SMA_DAYS:
         return None
@@ -130,7 +139,9 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None,
 
     sma = float(close.rolling(GUARD_SMA_DAYS).mean().iloc[-1])
     c = float(close.iloc[-1])
-    state = next_state(c, sma, normalize_prev(prev_state))
+    state = guard_states(close).iloc[-1]
+    if state not in STATES:
+        return None
     band_lo = sma * (1.0 - GUARD_BAND_PCT / 100.0)
     band_hi = sma * (1.0 + GUARD_BAND_PCT / 100.0)
 

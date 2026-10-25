@@ -657,6 +657,27 @@ def test_guard_states_matches_sequential_evaluate():
     assert mism == 0, f"{mism}日で不一致"
 
 
+def test_guard_evaluate_derives_state_from_history_not_prev():
+    """evaluate は履歴全体に規則を通して状態を求め、prev_state や単純比較に依存しない。
+    （state ファイル削除や初回起動で、帯を無視した判定が混ざらないこと）"""
+    closes = [100.0] * 60 + [85.0] * 5          # 急落 → 規則上は EXIT
+    for _ in range(10):                          # その後 SMA の +1% に張り付く: 単純比較なら HOLD、
+        sma = sum(closes[-50:]) / 50.0           # 帯(+2%)未満なので規則上は EXIT のまま
+        closes.append(sma * 1.01)
+    df = _daily_df(closes, start="2025-01-01")
+    now = (df.index[-1] + pd.Timedelta(days=1)).to_pydatetime().replace(tzinfo=timezone.utc)
+    info = lg.evaluate(df, prev_state=None, now_utc=now)
+    assert info is not None
+    assert info["price"] > info["sma"], "終値は SMA より上（単純比較なら HOLD になる局面）"
+    assert lg.next_state(info["price"], info["sma"], None) == lg.STATE_HOLD
+    assert info["state"] == lg.STATE_EXIT, "履歴に規則を通せば EXIT 継続"
+    # prev_state が何であっても判定は変わらない（通知の差分検出にだけ使う）
+    for prev in (None, "HOLD", "EXIT", "LONG"):
+        assert lg.evaluate(df, prev_state=prev, now_utc=now)["state"] == lg.STATE_EXIT
+    # 一括計算(backtest)と一致
+    assert lg.guard_states(lg.confirmed_daily_close(df, now)).iloc[-1] == lg.STATE_EXIT
+
+
 def test_guard_evaluate_guards_and_legacy_prev():
     df = _daily_df([100.0] * 30, start="2025-01-01")  # SMA50 に届かない
     assert lg.evaluate(df, now_utc=datetime(2025, 3, 1, tzinfo=timezone.utc)) is None
