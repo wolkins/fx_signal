@@ -329,6 +329,10 @@ GitHub側の定期実行を止めてください（どちらか一方だけに�
   初回起動・市場クローズ中は **一切呼びません**（コスト最小化）。
 - `risk_level=high` または `advise_caution=true` の時だけ、通知の先頭に ⚠️ 警告行を付けます。
   それ以外は従来どおりの通知です。
+- 価格変化率は判定モードに合わせた時間軸で渡します。`long_guard`（日足）は
+  `timeframe=daily` と **前日比 / 5営業日比**（`change_1d_pct` / `change_5d_pct`）、
+  `sma_cross`（5分足）は `timeframe=intraday` と 15分 / 1時間の変化率です。
+  キー名で時間軸を明示し、LLM が日足の変化を「1時間で急騰」のように取り違えないようにしています。
 - 監査ログ `risk_log.jsonl` に「入力・出力JSON・タイムスタンプ」を追記し、後から人手で
   レビューできます（機密は記録しません）。
 
@@ -360,6 +364,7 @@ GitHub側の定期実行を止めてください（どちらか一方だけに�
 | `RISK_SUPPRESS_SIGNALS` | `False` | `True` かつ `risk_level=high` の時だけシグナルを「情報のみ」に格下げ |
 | `RISK_LOOKAHEAD_HOURS` | `6` | 何時間先までのイベントを警戒対象にするか |
 | `RISK_SKIP_LLM_WHEN_QUIET` | `False` | `True` でイベント0件かつ値動き穏やか時はLLMを呼ばず決定論的に low（監査ログは残す） |
+| `RISK_QUIET_PCT` / `RISK_QUIET_PCT_DAILY` | `0.3` / `1.0` | 「穏やか」とみなす変化率の上限%。5分足は1時間変化率、日足は前日比で判定 |
 | `LLM_MODEL` | `claude-haiku-4-5` | 最安・最速ティア |
 | `LLM_TEMPERATURE` | `0.0` | 決定性重視 |
 

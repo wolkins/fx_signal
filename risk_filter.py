@@ -58,7 +58,8 @@ RISK_LOOKBACK_HOURS = 1         # 直近何時間前までの「通過済みイ�
 # 改善5（任意・既定OFF）: 警戒イベントが0件かつ値動きが穏やかなら、LLMを呼ばず
 # 決定論的に low を返してコストを節約する。ONでも監査ログは残す（llm_skipped=True）。
 RISK_SKIP_LLM_WHEN_QUIET = False
-RISK_QUIET_PCT = 0.3            # |直近1h変化率| がこの%未満を「穏やか」とみなす
+RISK_QUIET_PCT = 0.3            # |直近1h変化率| がこの%未満を「穏やか」とみなす（5分足判定）
+RISK_QUIET_PCT_DAILY = 1.0      # |前日比| がこの%未満を「穏やか」とみなす（日足判定 long_guard）
 
 # LLM 設定（最安・最速ティア。最新IDは docs.claude.com で確認: 2026-05 時点 Haiku 4.5）
 LLM_MODEL = "claude-haiku-4-5"
@@ -331,6 +332,10 @@ _SYSTEM_PROMPT = (
     "一切しません（それらは別システムが決定論的に処理済み）。\n"
     "与えられた『直近・直後の重要経済イベント一覧』と『直近の価格変化率』から、"
     "(1)イベントによるボラティリティ拡大リスク (2)急変動による為替介入の可能性、を評価してください。\n"
+    "価格変化率のキー名が時間軸を表します: change_15m_pct=15分間、change_1h_pct=1時間、"
+    "change_1d_pct=前日比（1営業日）、change_5d_pct=5営業日比。signal.timeframe が daily の時は"
+    "日足判定なので、変化率は日単位の尺度で評価すること（1日で±1%程度は通常の範囲。"
+    "『1時間で』『短時間で』などと時間軸を取り違えて書かない）。\n"
     "出力は次のスキーマに厳密準拠した JSON のみ。前後に説明文・コードフェンス・改行を付けないこと。\n"
     '{"risk_level":"high|medium|low","advise_caution":true/false,'
     '"headline":"日本語40字以内の短い警告見出し","reason":"日本語1〜2文の根拠",'
@@ -454,6 +459,32 @@ def _log(entry: dict) -> None:
 # ─────────────────────────────────────────────────────────────
 # 公開エントリ
 # ─────────────────────────────────────────────────────────────
+def _signal_payload(signal_info: dict) -> tuple[dict, float | None, float]:
+    """LLM に渡す signal 部と、静穏判定に使う (変化率, 閾値%) を判定モードに応じて組み立てる。
+
+    - 日足判定（long_guard / dow_guard）: change_1d_pct / change_5d_pct を持つ。
+      timeframe="daily" を明示し、前日比を静穏判定に使う（閾値 RISK_QUIET_PCT_DAILY）。
+    - 5分足判定（sma_cross）: change_15m_pct / change_1h_pct。1時間変化率を静穏判定に使う。
+    時間軸をキー名で明示することで、LLM が日足の変化を「1時間で」と誤解釈するのを防ぐ。
+    """
+    base = {"state": signal_info.get("state"), "price": signal_info.get("price")}
+    if "change_1d_pct" in signal_info or "change_5d_pct" in signal_info:
+        sig = {
+            **base,
+            "timeframe": "daily",
+            "change_1d_pct": signal_info.get("change_1d_pct"),
+            "change_5d_pct": signal_info.get("change_5d_pct"),
+        }
+        return sig, signal_info.get("change_1d_pct"), RISK_QUIET_PCT_DAILY
+    sig = {
+        **base,
+        "timeframe": "intraday",
+        "change_15m_pct": signal_info.get("change_15m_pct"),
+        "change_1h_pct": signal_info.get("change_1h_pct"),
+    }
+    return sig, signal_info.get("change_1h_pct"), RISK_QUIET_PCT
+
+
 def assess_risk(
     signal_info: dict,
     currencies: tuple[str, ...] | None = None,
@@ -505,14 +536,10 @@ def assess_risk(
         )
 
     # 2) LLM へ渡す構造化入力を組み立て（日時計算は上で済ませてある）
+    sig, quiet_change, quiet_pct = _signal_payload(signal_info)
     payload = {
         "pair": pair,
-        "signal": {
-            "state": signal_info.get("state"),
-            "price": signal_info.get("price"),
-            "change_15m_pct": signal_info.get("change_15m_pct"),
-            "change_1h_pct": signal_info.get("change_1h_pct"),
-        },
+        "signal": sig,
         "now_jst": now_utc.astimezone(TOKYO).strftime("%Y-%m-%d %H:%M JST"),
         "lookahead_hours": RISK_LOOKAHEAD_HOURS,
         "events": upcoming,
@@ -520,8 +547,8 @@ def assess_risk(
 
     # 改善5（任意）: イベント0件かつ値動きが穏やかなら、LLMを呼ばず決定論的に low。
     if RISK_SKIP_LLM_WHEN_QUIET and not upcoming:
-        ch = signal_info.get("change_1h_pct")
-        if ch is None or abs(ch) < RISK_QUIET_PCT:
+        ch = quiet_change
+        if ch is None or abs(ch) < quiet_pct:
             res = _result(
                 "ok",
                 risk_level="low",

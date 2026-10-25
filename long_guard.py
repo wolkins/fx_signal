@@ -146,12 +146,10 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None,
         "band_lo": band_lo,
         "band_hi": band_hi,
         "dist_pct": (c - sma) / sma * 100.0 if sma else None,
+        # リスク層(assess_risk)は change_1d_pct/5d_pct の存在で日足判定と認識し、
+        # timeframe=daily として LLM に渡す（15m/1h のキーは渡さない。時間軸の取り違え防止）。
         "change_1d_pct": _chg(1),
         "change_5d_pct": _chg(5),
-        # リスク層(assess_risk)が参照するキー。日足判定では短期変化率は意味が薄いので
-        # 1日/5日の変化率を同じ器に入れて渡す（LLM入力の構造を変えないため）。
-        "change_15m_pct": _chg(1),
-        "change_1h_pct": _chg(5),
         "time": f"{last_day.strftime('%Y-%m-%d')} 確定日足",
     }
 

@@ -229,6 +229,46 @@ def test_skip_llm_when_quiet():
     assert calls["n"] == 0 and r["status"] == "ok" and r["risk_level"] == "low"
 
 
+def test_daily_signal_payload_uses_daily_keys_and_threshold():
+    """日足判定(long_guard)の info は timeframe=daily・前日比/5日比で LLM に渡り、
+    静穏判定は前日比と RISK_QUIET_PCT_DAILY で行う（1h キーは出さない）。"""
+    seen = {}
+
+    def spy(p):
+        seen.update(p)
+        return ("got_text", OK_RAW)
+
+    daily = {"state": "HOLD", "price": 111.1, "change_1d_pct": 0.84, "change_5d_pct": 2.1}
+    with patched(rf, _fetch_calendar=lambda cur: [], _call_llm=spy,
+                 RISK_SKIP_LLM_WHEN_QUIET=False):
+        rf.assess_risk(daily, pair_label="AUD/JPY")
+    sig = seen["signal"]
+    assert sig["timeframe"] == "daily"
+    assert sig["change_1d_pct"] == 0.84 and sig["change_5d_pct"] == 2.1
+    assert "change_1h_pct" not in sig and "change_15m_pct" not in sig
+    # 前日比 0.84% は日足の閾値(1.0%)未満 → 静穏スキップ ON なら LLM を呼ばない
+    calls = {"n": 0}
+
+    def spy2(p):
+        calls["n"] += 1
+        return ("got_text", OK_RAW)
+
+    with patched(rf, _fetch_calendar=lambda cur: [], _call_llm=spy2,
+                 RISK_SKIP_LLM_WHEN_QUIET=True):
+        r = rf.assess_risk(daily)
+    assert calls["n"] == 0 and r["risk_level"] == "low"
+    # 前日比 1.5% は閾値以上 → 呼ぶ
+    with patched(rf, _fetch_calendar=lambda cur: [], _call_llm=spy2,
+                 RISK_SKIP_LLM_WHEN_QUIET=True):
+        rf.assess_risk({**daily, "change_1d_pct": 1.5})
+    assert calls["n"] == 1
+    # 5分足判定の info は従来どおり intraday
+    with patched(rf, _fetch_calendar=lambda cur: [], _call_llm=spy,
+                 RISK_SKIP_LLM_WHEN_QUIET=False):
+        rf.assess_risk(SIG)
+    assert seen["signal"]["timeframe"] == "intraday" and "change_1h_pct" in seen["signal"]
+
+
 # ─────────────────────────────────────────────────────────────
 # 機密: Slack 失敗ログに Webhook URL を出さない
 # ─────────────────────────────────────────────────────────────
@@ -592,8 +632,9 @@ def test_guard_evaluate_guards_and_legacy_prev():
     info = lg.evaluate(df2, prev_state="LONG", now_utc=datetime(2025, 3, 2, tzinfo=timezone.utc))
     assert info is not None and info["state"] in lg.STATES
     assert "確定日足" in info["time"]
-    # リスク層が参照するキーが存在する
-    assert "change_15m_pct" in info and "change_1h_pct" in info
+    # リスク層が日足判定と認識するキーが存在し、5分足用のキーは渡さない
+    assert "change_1d_pct" in info and "change_5d_pct" in info
+    assert "change_15m_pct" not in info and "change_1h_pct" not in info
 
 
 def test_guard_message_format():
@@ -736,7 +777,8 @@ def test_dow_evaluate_guards_and_message():
     info = dg.evaluate(df, now_utc=now)
     assert info is not None and info["state"] in dg.STATES
     assert (last - pd.Timedelta(days=1)).strftime("%Y-%m-%d") in info["time"]
-    assert "change_15m_pct" in info and "change_1h_pct" in info
+    assert "change_1d_pct" in info and "change_5d_pct" in info
+    assert "change_15m_pct" not in info and "change_1h_pct" not in info
     m = dg.format_message(info, label="AUD/JPY", first_run=True)
     assert "監視を開始" in m and info["state"] in m
     ex = {"state": dg.STATE_EXIT, "price": 100.0, "key_low": 101.2, "key_low_date": "2024-03-01",

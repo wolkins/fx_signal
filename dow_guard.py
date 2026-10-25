@@ -314,10 +314,9 @@ def evaluate(df: pd.DataFrame, prev_state: str | None = None,
         "reentry_high": rh.price if rh else None,
         "reentry_high_date": rh.date.strftime("%Y-%m-%d") if rh else None,
         "event_date": ev[0].strftime("%Y-%m-%d") if ev else None,
+        # リスク層(assess_risk)は change_1d_pct/5d_pct の存在で日足判定と認識する
         "change_1d_pct": _chg(1),
         "change_5d_pct": _chg(5),
-        "change_15m_pct": _chg(1),   # リスク層(assess_risk)が参照するキー（器を揃える）
-        "change_1h_pct": _chg(5),
         "time": f"{last_day.strftime('%Y-%m-%d')} 確定日足",
     }
 
