@@ -888,6 +888,72 @@ def test_dow_evaluate_guards_and_message():
     assert "復帰" in m3 and "99.500" in m3
 
 
+def test_dow_line_change_detection_and_message():
+    ex = {"state": dg.STATE_EXIT, "price": 88.716, "key_low": 91.315, "key_low_date": "2026-04-30",
+          "reentry_high": 90.334, "reentry_high_date": "2026-10-22", "time": "2026-10-27 確定日足"}
+    assert dg.line_info(ex) == (90.334, "2026-10-22")
+    ho = {**ex, "state": dg.STATE_HOLD, "key_low": 110.195, "key_low_date": "2026-10-30"}
+    assert dg.line_info(ho) == (110.195, "2026-10-30")
+    # 旧形式（line キー無し）/ 状態が違う / 同値 → 変化扱いしない
+    assert not dg.line_changed(None, ex)
+    assert not dg.line_changed({"state": "EXIT"}, ex)
+    assert not dg.line_changed({"state": "HOLD", "line": 1.0}, ex)
+    assert not dg.line_changed({"state": "EXIT", "line": 90.3340004}, ex)
+    # ライン変更 / 未形成→形成
+    prev = {"state": "EXIT", "line": 90.541, "line_date": "2026-09-22"}
+    assert dg.line_changed(prev, ex)
+    assert dg.line_changed({"state": "EXIT", "line": None}, ex)
+    assert not dg.line_changed({"state": "EXIT", "line": None}, {**ex, "reentry_high": None})
+    m = dg.format_line_change(prev, ex, label="NZD/JPY")
+    assert "復帰ライン" in m and "下がりました" in m and "90.541" in m and "90.334" in m
+    assert "EXIT のまま" in m and "+1.8%" in m
+    m2 = dg.format_line_change({"state": "HOLD", "line": 108.701, "line_date": "2026-10-01"},
+                               {**ho, "price": 110.806}, label="AUD/JPY")
+    assert "押し安値" in m2 and "切り上がりました" in m2 and "108.701" in m2 and "110.195" in m2
+    assert "HOLD のまま" in m2
+
+
+def test_process_pair_guard_notifies_line_change_once():
+    """状態が同じでもラインが動いた日に1回だけ通知し、state を更新する（2回目は通知しない）。"""
+    import json as _json
+    sent: list[str] = []
+    base = {"state": dg.STATE_EXIT, "price": 88.716, "key_low": 91.315, "key_low_date": "2026-04-30",
+            "reentry_high": 90.334, "reentry_high_date": "2026-10-22", "time": "2026-10-27 確定日足",
+            "change_1d_pct": 0.1, "change_5d_pct": 0.2}
+    cur = {"info": dict(base)}
+    with tempfile.TemporaryDirectory() as d:
+        sp = Path(d) / "state_NZDJPY.json"
+        with patched(fx, STRATEGY="long_guard", state_path=lambda t: sp,
+                     guard_engine=lambda t: "dow", notify=sent.append,
+                     fetch_daily_ohlc=lambda *a, **k: pd.DataFrame({"Close": [1.0]})), \
+             patched(dg, evaluate=lambda df, prev_state=None, now_utc=None: dict(cur["info"])):
+            # 初回起動 → line が保存される
+            assert fx._process_pair_guard("NZDJPY=X") == "first_run"
+            st = fx.load_state(sp)
+            assert st["line"] == 90.334 and st["line_date"] == "2026-10-22"
+            # 同じライン → 変化なし
+            assert fx._process_pair_guard("NZDJPY=X") == "nochange"
+            assert len(sent) == 1
+            # ラインが下がった → 1回通知して保存、以降は通知しない
+            cur["info"] = {**base, "reentry_high": 90.0, "reentry_high_date": "2026-11-05"}
+            assert fx._process_pair_guard("NZDJPY=X") == "line_changed"
+            assert len(sent) == 2 and "復帰ライン" in sent[-1] and "90.000" in sent[-1]
+            assert fx.load_state(sp)["line"] == 90.0
+            assert fx._process_pair_guard("NZDJPY=X") == "nochange"
+            assert len(sent) == 2
+            # 旧形式 state（line 無し）は変化扱いしない
+            st = fx.load_state(sp); st.pop("line"); st.pop("line_date")
+            sp.write_text(_json.dumps(st), encoding="utf-8")
+            assert fx._process_pair_guard("NZDJPY=X") == "nochange"
+            assert len(sent) == 2
+            # 状態が切り替わる通知は従来どおり（リスク層は無効化して確認）
+            cur["info"] = {**base, "state": dg.STATE_HOLD, "key_low": 89.0, "key_low_date": "2026-11-01"}
+            with patched(fx, _assess_risk_safely=lambda *a, **k: None):
+                assert fx._process_pair_guard("NZDJPY=X") == "changed"
+            assert len(sent) == 3 and "復帰シグナル" in sent[-1]
+            assert fx.load_state(sp)["line"] == 89.0
+
+
 def test_guard_engine_mapping_and_env_override():
     import os as _os
     saved = _os.environ.pop("GUARD_DOW_PAIRS", None)

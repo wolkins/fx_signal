@@ -374,6 +374,68 @@ def format_message(info: dict, *, label: str, decimals: int = 3,
     )
 
 
+# ─────────────────────────────────────────────────────────────
+# 離脱/復帰ラインの変化通知（状態は変わらないがラインが動いた日に1回）
+# ─────────────────────────────────────────────────────────────
+def line_info(info: dict) -> tuple[float | None, str | None]:
+    """現在の状態で監視しているライン（HOLD=実質押し安値 / EXIT=復帰ライン）とその日付。
+
+    fx_signal は state ファイルに `line` / `line_date` として保存し、次回以降の比較に使う。
+    """
+    if info.get("state") == STATE_HOLD:
+        return info.get("key_low"), info.get("key_low_date")
+    return info.get("reentry_high"), info.get("reentry_high_date")
+
+
+def line_changed(prev: dict | None, info: dict, decimals: int = 3) -> bool:
+    """前回保存したラインと今回のラインが違うか（同じ状態の中での比較）。
+
+    旧形式の state ファイル（`line` キー無し）は「不明」として変化扱いしない。
+    未形成(None) ↔ 形成済みの変化は通知対象。
+    """
+    if not prev or prev.get("state") != info.get("state") or "line" not in prev:
+        return False
+    old = prev.get("line")
+    new, _ = line_info(info)
+    if old is None or new is None:
+        return old is not new  # 片方だけ None なら変化
+    return round(float(old), decimals) != round(float(new), decimals)
+
+
+def format_line_change(prev: dict, info: dict, *, label: str, decimals: int = 3) -> str:
+    st = info["state"]
+    old, old_date = prev.get("line"), prev.get("line_date")
+    new, new_date = line_info(info)
+    price = float(info["price"])
+    o = _fmt(old, decimals) + (f"（{old_date}）" if old is not None and old_date else "")
+    n = _fmt(new, decimals) + (f"（{new_date}）" if new is not None and new_date else "")
+    if st == STATE_HOLD:
+        if old is not None and new is not None:
+            direction = "切り上がりました" if new > old else "切り下がりました"
+        else:
+            direction = "変わりました"
+        gap = f"（終値との差 {(price / new - 1) * 100:+.1f}%）" if new else ""
+        return (
+            f"📌 {label} 実質押し安値が{direction}（状態は HOLD のまま・ロング維持 🟢）\n"
+            f"実質押し安値: {o} → {n}\n"
+            f"日足終値: {price:.{decimals}f}{gap} — ここを終値で割ったら離脱を通知\n"
+            f"{info['time']}"
+        )
+    if old is not None and new is not None:
+        direction = "下がりました" if new < old else "上がりました"
+    elif new is not None:
+        direction = "できました"
+    else:
+        direction = "消えました（形成待ち）"
+    gap = f"（復帰まであと {(new / price - 1) * 100:+.1f}%）" if new else ""
+    return (
+        f"📌 {label} 復帰ラインが{direction}（状態は EXIT のまま・待機 🛡️）\n"
+        f"復帰ライン: {o} → {n}\n"
+        f"日足終値: {price:.{decimals}f}{gap} — ここを終値で超えたら復帰(HOLD)を通知\n"
+        f"{info['time']}"
+    )
+
+
 def stance_label(state: str | None) -> str:
     if state == STATE_HOLD:
         return "ロング維持🟢"

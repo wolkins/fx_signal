@@ -363,6 +363,9 @@ def save_state(path: Path, info: dict) -> None:
         "guard": info.get("guard"),
         "updated_at": datetime.now(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST"),
     }
+    if "line" in info:  # ロング保護: 監視中の離脱/復帰ライン（ダウエンジン。変化通知の比較に使う）
+        payload["line"] = info["line"]
+        payload["line_date"] = info.get("line_date")
     path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -477,7 +480,8 @@ def process_pair(ticker: str) -> str:
     """1通貨ペアを判定し、状態変化時のみ通知する。結果の種別を返す。
 
     返り値: "fetch_failed"（取得そのものが空＝障害の可能性）/ "no_data"（データは
-    あるが市場クローズ/本数不足）/ "first_run" / "changed" / "nochange"。
+    あるが市場クローズ/本数不足）/ "first_run" / "changed" / "nochange"
+    （ロング保護のダウエンジンではさらに "line_changed"＝状態同じでライン変更を通知）。
 
     ペアごとに独立した state_<PAIR>.json で状態を管理する。
     1ペアの処理が例外を投げても、呼び出し側で他ペアは止めない。
@@ -596,6 +600,8 @@ def _process_pair_guard(ticker: str) -> str:
     """ロング保護モード（STRATEGY="long_guard"）の1ペア処理。
 
     確定日足だけで HOLD/EXIT を判定し、切り替わった日に1回だけ通知する。
+    ダウエンジンでは状態が同じでも監視ライン（押し安値/復帰ライン）が動いた日に1回通知する
+    （state ファイルの line/line_date と比較。返り値 "line_changed"）。
     エンジンはペアごとに guard_engine() で選ぶ（sma=long_guard / dow=dow_guard）。
     状態は 1日に最大1回しか変わらないので、cron が5分おきでも通知は増えない。
     旧戦略の状態ファイル（LONG/SHORT）や別エンジンで保存した状態が残っていれば、
@@ -625,6 +631,10 @@ def _process_pair_guard(ticker: str) -> str:
         print(f"[{label}] 日足の本数不足/鮮度不良/判定不能のため判定をスキップ（{engine}）。")
         return "no_data"
     info["guard"] = engine
+    if hasattr(lg, "line_info"):  # ダウ: 監視中のラインを state に残し、動いた日に通知する
+        line, line_date = lg.line_info(info)
+        info["line"] = round(float(line), 6) if line is not None else None
+        info["line_date"] = line_date
 
     if prev_state is None:
         notify(lg.format_message(info, label=label, decimals=decimals, first_run=True))
@@ -633,6 +643,22 @@ def _process_pair_guard(ticker: str) -> str:
         return "first_run"
 
     if prev_state == info["state"]:
+        if hasattr(lg, "line_changed") and lg.line_changed(prev, info, decimals):
+            # 状態は同じだが離脱/復帰ラインが動いた（新しい戻り高値・押し安値の切り上げなど）。
+            # 売買判断は変わらないのでリスク層は付けず、1日1回だけ知らせる。
+            notify(lg.format_line_change(prev, info, label=label, decimals=decimals))
+            save_state(path, info)
+            print(
+                f"[{label}] ロング保護({engine}) 状態 {info['state']} のままライン変更:"
+                f" {prev.get('line')} → {info.get('line')}（通知）"
+            )
+            return "line_changed"
+        if "line" in info and "line" not in prev:
+            # 旧形式の state（ライン未保存）→ 通知せずに今回のラインを保存し、次回から比較する
+            save_state(path, info)
+            print(f"[{label}] ロング保護({engine}) 状態変化なし: {info['state']}"
+                  f"（監視ライン {info.get('line')} を state に保存・通知なし）")
+            return "nochange"
         print(f"[{label}] ロング保護({engine}) 状態変化なし: {info['state']}（通知スキップ）")
         return "nochange"
 
@@ -803,7 +829,7 @@ def main() -> int:
     # 市場クローズは "no_data" なので除外され、誤検知しない。
     # "error"（process_pairが例外）も含めることで、例外を投げ続ける故障も拾える。
     all_failed = bool(outcomes) and all(o in ("fetch_failed", "error") for o in outcomes)
-    data_ok = any(o in ("first_run", "changed", "nochange", "blocked") for o in outcomes)
+    data_ok = any(o in ("first_run", "changed", "nochange", "line_changed", "blocked") for o in outcomes)
     try:
         update_data_health(all_failed, data_ok)
     except Exception as exc:  # noqa: BLE001 - 健全性チェックの失敗で本体を止めない
