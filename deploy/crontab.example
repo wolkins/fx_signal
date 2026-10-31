@@ -5,12 +5,13 @@
 #       JST想定の時刻（ハートビート等）はサーバTZに合わせて調整する。
 #       （判定ロジック自体はコード内で Asia/Tokyo 固定なのでサーバTZに依存しない）
 
-# 本体監視: 5分おき。市場クローズ中は STALE_MINUTES ガードが自動スキップするので
-# 毎時実行で安全。GitHub と違いスロットルされず正確に動く。
-# ※ 既定の long_guard（日足）モードでは状態は1日1回しか変わらないので、5分おきは不要。
-#   日足が確定する 00:00 UTC（09:00 JST）以降に1時間おき程度で十分（Yahoo への負荷も減る）。
-#   sma_cross（5分足）モードに戻す時だけ */5 にする。
-15 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
+# 本体監視（既定の long_guard・日足モード）: 火〜土の 9〜12 時台に毎時1回（サーバTZ=JST の例）。
+#   日足は 00:00 UTC（09:00 JST）に確定するので、月〜金の足はそれぞれ火〜土の朝に判定すれば足りる。
+#   土曜 10 時以降〜月曜は新しい足ができないので実行しても無駄（害はない）。
+#   9〜12 時台に 4 回あるのは yfinance の一時失敗に備えた再試行用。サーバが UTC なら "15 0-3 * * 2-6"。
+15 9-12 * * 2-6 /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
+# sma_cross（5分足）モードに戻す時だけ 5分おきにする。市場クローズ中は STALE_MINUTES ガードが
+# 自動スキップするので毎時でも安全。
 # */5 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
 
 # 週次ハートビート（死活確認）。下は「火曜08:00」をサーバTZがJSTの場合の例。
