@@ -595,7 +595,7 @@ def test_determinism_backtest_matches_evaluate():
 # ロング保護ガード（long_guard.py / STRATEGY="long_guard"）
 # ─────────────────────────────────────────────────────────────
 import long_guard as lg  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 
 
 def _daily_df(closes, start="2025-01-01"):
@@ -1009,6 +1009,163 @@ def test_dow_wave_rule_leg_ignores_short_bounces():
 # ─────────────────────────────────────────────────────────────
 # プレーン実行用ランナー（pytest 不要）
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# 5分足ショート（short_signal.py）と Twelve Data ラッパー（twelvedata.py）
+# ─────────────────────────────────────────────────────────────
+import short_signal as ss  # noqa: E402
+import twelvedata as td  # noqa: E402
+
+
+def _bars_5m(closes, start="2026-11-02 00:00"):
+    idx = pd.date_range(start, periods=len(closes), freq="5min")
+    c = pd.Series(closes, index=idx, dtype=float)
+    return pd.DataFrame({"Open": c.shift(1).fillna(c), "High": c + 0.02, "Low": c - 0.02, "Close": c})
+
+
+def test_twelvedata_parse_weekend_and_confirmed():
+    vals = [  # API は新しい順
+        {"datetime": "2026-11-02 00:05:00", "open": "1.0", "high": "1.1", "low": "0.9", "close": "1.05"},
+        {"datetime": "2026-11-01 19:00:00", "open": "1.0", "high": "1.9", "low": "0.5", "close": "1.0"},  # 日曜 19:00 → 捨てる
+        {"datetime": "2026-11-01 22:00:00", "open": "1.0", "high": "1.1", "low": "0.9", "close": "1.0"},  # 日曜 22:00 → 残す
+        {"datetime": "2026-10-31 14:00:00", "open": "1.0", "high": "1.1", "low": "0.3", "close": "1.0"},  # 土曜 → 捨てる
+        {"datetime": "2026-10-30 21:00:00", "open": "1.0", "high": "1.1", "low": "0.9", "close": "1.0"},  # 金曜 21:00 → 捨てる
+        {"datetime": "2026-10-30 20:55:00", "open": "1.0", "high": "1.1", "low": "0.9", "close": "1.0"},  # 金曜 20:55 → 残す
+    ]
+    df = td.parse_values(vals)
+    assert list(df.columns) == ["Open", "High", "Low", "Close"] and df.index.is_monotonic_increasing
+    kept = td.drop_weekend(df)
+    assert [t.strftime("%m-%d %H:%M") for t in kept.index] == ["10-30 20:55", "11-01 22:00", "11-02 00:05"]
+    # 進行中の足を落とす（00:05 開始の 5分足は 00:10 以降に確定）
+    now = datetime(2026, 11, 2, 0, 8, tzinfo=timezone.utc)
+    assert td.confirmed_only(kept, "5min", now).index[-1].strftime("%H:%M") == "22:00"
+    now = datetime(2026, 11, 2, 0, 10, tzinfo=timezone.utc)
+    assert td.confirmed_only(kept, "5min", now).index[-1].strftime("%H:%M") == "00:05"
+    assert td.symbol_for("USDJPY=X") == "USD/JPY" and td.symbol_for("AUD/JPY") == "AUD/JPY"
+    # キー未設定なら通信せず空
+    with no_env(td.API_KEY_ENV):
+        assert td.fetch_ohlc("USDJPY=X").empty
+
+
+def test_short_states_cross_and_deadband():
+    # 下落 → 上昇: SMA50 が SMA100 を下抜け→上抜け
+    closes = [100 - i * 0.01 for i in range(200)] + [98 + i * 0.01 for i in range(200)]
+    df = _bars_5m(closes)
+    st = ss.short_states(df)
+    assert st.iloc[:99].isna().all() or all(v is None for v in st.iloc[:99])
+    assert st.iloc[199] == ss.STATE_SHORT
+    assert st.iloc[-1] == ss.STATE_FLAT
+    # 横ばい（SMA 拮抗）ではデッドバンドで前回状態を維持する
+    flat = _bars_5m([100.0] * 150)
+    with patched(fx, DEADBAND_MODE="pct", HYSTERESIS_PCT=0.5):
+        st2 = ss.short_states(pd.concat([df.iloc[:200], _bars_5m([98.0] * 300, start="2026-11-02 16:40")]))
+        assert st2.iloc[-1] == ss.STATE_SHORT  # 乖離ゼロでも前回(SHORT)を維持
+    assert ss.short_states(flat).iloc[-1] in (ss.STATE_FLAT, ss.STATE_SHORT)  # 初回は raw（乖離0 → FLAT）
+
+
+def test_short_evaluate_gate_and_stale():
+    closes = [100 - i * 0.01 for i in range(200)]
+    df = _bars_5m(closes)
+    df.attrs["source"] = "test"
+    now = (df.index[-1] + pd.Timedelta(minutes=7)).to_pydatetime().replace(tzinfo=timezone.utc)
+    env_down = {"down": True, "reentry_high": 100.5, "date": "2026-11-01 10:00", "resume_low": None}
+    info = ss.evaluate(df, env_down, "1h", now_utc=now)
+    assert info["state"] == ss.STATE_SHORT and info["raw_state"] == ss.STATE_SHORT
+    env_up = {"down": False, "reentry_high": None, "date": None, "resume_low": 97.5, "resume_date": "x"}
+    info2 = ss.evaluate(df, env_up, "1h", now_utc=now)
+    assert info2["state"] == ss.STATE_FLAT and info2["raw_state"] == ss.STATE_SHORT  # ゲートで売り禁止
+    assert ss.evaluate(df, None, "1h", now_utc=now) is None          # 環境足判定不能 → 合図なし
+    assert ss.evaluate(df, None, "none", now_utc=now)["state"] == ss.STATE_SHORT  # ゲート無効
+    late = (df.index[-1] + pd.Timedelta(minutes=45)).to_pydatetime().replace(tzinfo=timezone.utc)
+    assert ss.evaluate(df, env_down, "1h", now_utc=late) is None    # 鮮度不良
+    assert ss.evaluate(df.iloc[:50], env_down, "1h", now_utc=now) is None  # 本数不足
+    m = ss.format_message(info, label="USD/JPY", first_run=True)
+    assert "ショート監視を開始" in m and "SHORT" in m and "100.500" in m
+    m2 = ss.format_message(info2, label="USD/JPY")
+    assert "手仕舞い" in m2 and "下降ダウ終了" in m2 and "97.500" in m2
+    m3 = ss.format_message(info, label="USD/JPY")
+    assert "ショート開始" in m3
+
+
+def test_short_env_downtrend_mirror():
+    # 上昇 → 崩れ → 下降 の 1時間足。鏡像ダウで「下降継続」になる
+    closes = []
+    v = 100.0
+    for _ in range(8):            # 上昇ジグザグ（10本上げ・4本下げ）
+        for _ in range(10): v += 0.2; closes.append(v)
+        for _ in range(4): v -= 0.15; closes.append(v)
+    for _ in range(8):            # 下降ジグザグ（10本下げ・4本上げ）
+        for _ in range(10): v -= 0.2; closes.append(v)
+        for _ in range(4): v += 0.15; closes.append(v)
+    idx = pd.date_range("2026-01-05 00:00", periods=len(closes), freq="1h")
+    c = pd.Series(closes, index=idx)
+    bars = pd.DataFrame({"Open": c.shift(1).fillna(c), "High": c + 0.1, "Low": c - 0.1, "Close": c})
+    env = ss.env_downtrend(bars)
+    assert env is not None and env["down"] is True and env["reentry_high"] is not None
+    assert env["reentry_high"] > float(c.iloc[-1])
+    ser = ss.env_downtrend_series(bars)
+    assert bool(ser.iloc[-1]) is True and bool(ser.iloc[110]) is False
+    assert ss.env_downtrend(bars.iloc[:10]) is None
+
+
+def test_short_process_pair_flow():
+    """初回→変化なし→SHORT→FLAT の通知と state 保存。データ取得と環境足は差し替える。"""
+    sent: list[str] = []
+    closes_down = [100 - i * 0.01 for i in range(200)]
+    df_down = _bars_5m(closes_down); df_down.attrs["source"] = "test"
+    df_up = _bars_5m(closes_down + [98 + i * 0.01 for i in range(200)]); df_up.attrs["source"] = "test"
+    cur = {"df": df_down, "env": {"down": True, "reentry_high": 101.0, "date": "d", "resume_low": None}}
+    real_eval = ss.evaluate
+    with tempfile.TemporaryDirectory() as d:
+        sp = Path(d) / "short_state_USDJPY.json"
+        with patched(ss, state_path=lambda t: sp, fetch_bars=lambda t, now_utc=None: cur["df"],
+                     load_env=lambda t, now_utc=None: cur["env"], env_gate=lambda: "1h",
+                     evaluate=lambda df, env, gate, now_utc=None: real_eval(
+                         df, env, gate, now_utc=(df.index[-1] + pd.Timedelta(minutes=6)).to_pydatetime().replace(tzinfo=timezone.utc))), \
+             patched(fx, notify=sent.append):
+            assert ss.process_pair("USDJPY=X") == "first_run"
+            assert fx.load_state(sp)["state"] == "SHORT" and "開始しました" in sent[-1]
+            assert ss.process_pair("USDJPY=X") == "nochange" and len(sent) == 1
+            cur["env"] = {"down": False, "reentry_high": None, "date": None, "resume_low": 97.0, "resume_date": "d"}
+            assert ss.process_pair("USDJPY=X") == "changed"
+            assert fx.load_state(sp)["state"] == "FLAT" and "手仕舞い" in sent[-1] and len(sent) == 2
+            cur["env"] = {"down": True, "reentry_high": 101.0, "date": "d", "resume_low": None}
+            assert ss.process_pair("USDJPY=X") == "changed" and "ショート開始" in sent[-1]
+            cur["df"] = df_up
+            assert ss.process_pair("USDJPY=X") == "changed" and "SMA 再クロス" in sent[-1]
+            cur["df"] = pd.DataFrame()
+            assert ss.process_pair("USDJPY=X") == "fetch_failed"
+            cur["df"] = df_up; cur["env"] = None
+            assert ss.process_pair("USDJPY=X") == "no_data"
+
+
+def test_short_pairs_env_and_cache(tmp_path=None):
+    with no_env("SHORT_PAIRS"):
+        assert ss.short_pairs() == ["USDJPY=X", "AUDJPY=X"]
+    os.environ["SHORT_PAIRS"] = "usdjpy, NZDJPY=X"
+    try:
+        assert ss.short_pairs() == ["USDJPY=X", "NZDJPY=X"]
+    finally:
+        del os.environ["SHORT_PAIRS"]
+    os.environ["SHORT_ENV_GATE"] = "none"
+    try:
+        assert ss.env_gate() == "none"
+    finally:
+        del os.environ["SHORT_ENV_GATE"]
+    with no_env("SHORT_ENV_GATE"):
+        assert ss.env_gate() == "1h"
+    # 環境足キャッシュ: 期限内は再取得しない
+    calls = []
+    with tempfile.TemporaryDirectory() as d:
+        cp = Path(d) / "short_env_USDJPY.json"
+        env = {"down": True, "reentry_high": 1.0, "date": "x", "resume_low": None}
+        with patched(ss, env_cache_path=lambda t: cp, fetch_env_bars=lambda t: calls.append(1) or pd.DataFrame({"Close": [1.0]}),
+                     env_downtrend=lambda b: env):
+            now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+            assert ss.load_env("USDJPY=X", now) == env and len(calls) == 1
+            assert ss.load_env("USDJPY=X", now + timedelta(minutes=30)) == env and len(calls) == 1
+            assert ss.load_env("USDJPY=X", now + timedelta(minutes=70)) == env and len(calls) == 2
+
+
 def _run_all() -> int:
     tests = sorted(
         (name, obj)

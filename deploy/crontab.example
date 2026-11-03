@@ -14,6 +14,13 @@
 # 自動スキップするので毎時でも安全。
 # */5 * * * * /home/USER/fx_signal/deploy/run.sh >> /home/USER/fx_signal/cron.log 2>&1
 
+# 5分足ショート監視（USD/JPY・AUD/JPY、short_signal.py）: 平日 5 分おき。土日は市場クローズでスキップされる
+#   だけだが、Twelve Data 無料枠（800/日）の節約のため曜日で止める（月 0:00〜土 6:59 JST ≒ 日 22:00〜金 21:00 UTC）。
+#   サーバTZ=JST の例。日曜 22:00 UTC = 月曜 07:00 JST なので月曜は 7 時以降、土曜は 6 時台まで。
+*/5 7-23 * * 1 /home/USER/fx_signal/deploy/run.sh --short >> /home/USER/fx_signal/cron.log 2>&1
+*/5 * * * 2-5 /home/USER/fx_signal/deploy/run.sh --short >> /home/USER/fx_signal/cron.log 2>&1
+*/5 0-6 * * 6 /home/USER/fx_signal/deploy/run.sh --short >> /home/USER/fx_signal/cron.log 2>&1
+
 # 週次ハートビート（死活確認）。下は「火曜08:00」をサーバTZがJSTの場合の例。
 # サーバがUTCなら "0 23 * * 1"（月23:00 UTC = 火08:00 JST）にする。
 # ※ 既定の long_guard（日足）では鮮度を「確定日足が5日より古いか」で見るので、

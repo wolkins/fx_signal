@@ -840,4 +840,8 @@ def main() -> int:
 if __name__ == "__main__":
     if "--heartbeat" in sys.argv:
         sys.exit(heartbeat())
+    if "--short" in sys.argv:
+        # 5分足ショート監視（USD/JPY・AUD/JPY）。ロング保護とは独立の state/通知。short_signal.py 参照
+        import short_signal
+        sys.exit(short_signal.main())
     sys.exit(main())
