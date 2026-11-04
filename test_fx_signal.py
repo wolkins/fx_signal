@@ -1138,6 +1138,69 @@ def test_short_process_pair_flow():
             assert ss.process_pair("USDJPY=X") == "no_data"
 
 
+def test_short_stop_loss_flow():
+    """損切り: 開始通知にライン → 高値到達で 🛑 → 規則が SHORT のままなら再入場しない → FLAT に戻ったら解除 → 再入場。"""
+    sent: list[str] = []
+    closes_down = [100 - i * 0.01 for i in range(200)]
+    df_down = _bars_5m(closes_down); df_down.attrs["source"] = "test"
+    # 建玉後に大きな上ヒゲ（ラインを超える）を 1 本足す。SMA は依然 SHORT。
+    df_spike = _bars_5m(closes_down + [98.0]); df_spike.loc[df_spike.index[-1], "High"] = 99.5; df_spike.attrs["source"] = "test"
+    df_up = _bars_5m(closes_down + [98 + i * 0.01 for i in range(200)]); df_up.attrs["source"] = "test"
+    env_down = {"down": True, "reentry_high": 101.0, "date": "d", "resume_low": None}
+    env_up = {"down": False, "reentry_high": None, "date": None, "resume_low": 97.0, "resume_date": "d"}
+    cur = {"df": df_down, "env": env_up}
+    real_eval = ss.evaluate
+    with tempfile.TemporaryDirectory() as d, no_env("SHORT_STOP_PAIRS"), no_env("SHORT_STOP_ATR"):
+        sp = Path(d) / "short_state_USDJPY.json"
+        with patched(ss, state_path=lambda t: sp, fetch_bars=lambda t, now_utc=None: cur["df"],
+                     load_env=lambda t, now_utc=None: cur["env"], env_gate=lambda: "1h",
+                     evaluate=lambda df, env, gate, now_utc=None: real_eval(
+                         df, env, gate, now_utc=(df.index[-1] + pd.Timedelta(minutes=6)).to_pydatetime().replace(tzinfo=timezone.utc))), \
+             patched(fx, notify=sent.append):
+            assert ss.stop_atr_for("USDJPY=X") == 3.0 and ss.stop_atr_for("AUDJPY=X") is None
+            assert ss.process_pair("USDJPY=X") == "first_run" and fx.load_state(sp)["state"] == "FLAT"
+            cur["env"] = env_down
+            assert ss.process_pair("USDJPY=X") == "changed" and "損切り目安" in sent[-1]
+            st = fx.load_state(sp)
+            assert st["state"] == "SHORT" and abs(st["stop_line"] - (st["entry_price"] + 3 * _atr_of(df_down))) < 1e-6
+            assert st["entry_bar"] == df_down.index[-1].strftime("%Y-%m-%dT%H:%M")
+            # ラインに届かない間は変化なし
+            assert ss.process_pair("USDJPY=X") == "nochange" and len(sent) == 2
+            # 建玉足より後の足の高値がラインに到達 → 損切り通知、FLAT・待機
+            cur["df"] = df_spike
+            assert ss.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("🛑") and "損切りライン" in sent[-1]
+            st = fx.load_state(sp)
+            assert st["state"] == "FLAT" and st["stopped"] is True and st["exit_reason"] == "stop"
+            # 規則はまだ SHORT（環境足も下降）だが再入場しない
+            assert ss.process_pair("USDJPY=X") == "nochange" and len(sent) == 3 and fx.load_state(sp)["stopped"] is True
+            # 規則が FLAT に戻る（環境足終了）→ 待機解除、通知なし
+            cur["env"] = env_up
+            assert ss.process_pair("USDJPY=X") == "nochange" and len(sent) == 3 and fx.load_state(sp)["stopped"] is False
+            # 再び SHORT 条件 → 新しい建値・ラインで開始通知
+            cur["env"] = env_down
+            assert ss.process_pair("USDJPY=X") == "changed" and "損切り目安" in sent[-1]
+            assert fx.load_state(sp)["entry_bar"] == df_spike.index[-1].strftime("%Y-%m-%dT%H:%M")
+            # SMA 再クロスによる通常の手仕舞いは従来どおり ⚪
+            cur["df"] = df_up
+            assert ss.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("⚪") and "SMA 再クロス" in sent[-1]
+            assert fx.load_state(sp)["stopped"] is False and fx.load_state(sp)["exit_reason"] == "rule"
+    # 損切り対象外のペアではラインを付けない
+    os.environ["SHORT_STOP_PAIRS"] = ""
+    try:
+        assert ss.stop_atr_for("USDJPY=X") is None
+    finally:
+        del os.environ["SHORT_STOP_PAIRS"]
+    os.environ["SHORT_STOP_PAIRS"] = "usdjpy,AUDJPY"; os.environ["SHORT_STOP_ATR"] = "4"
+    try:
+        assert ss.stop_atr_for("AUDJPY=X") == 4.0
+    finally:
+        del os.environ["SHORT_STOP_PAIRS"]; del os.environ["SHORT_STOP_ATR"]
+
+
+def _atr_of(df):
+    return float(fx.compute_atr(df, fx.ATR_PERIOD).iloc[-1])
+
+
 def test_short_pairs_env_and_cache(tmp_path=None):
     with no_env("SHORT_PAIRS"):
         assert ss.short_pairs() == ["USDJPY=X", "AUDJPY=X"]

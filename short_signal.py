@@ -10,6 +10,9 @@
     「下降ダウ継続（安値更新後、実質戻り高値を終値で超えていない）」の間だけ SHORT を許す。
     環境足が下降でなければ FLAT（買い戻し）。実質戻り高値は損切りの目安として通知に載せる。
   - 最新の確定 5分足が STALE_MINUTES より古ければ市場クローズ中とみなしスキップ。
+  - 損切りライン（SHORT_STOP_PAIRS のペアのみ、既定 USDJPY）: ショート開始足の終値 + SHORT_STOP_ATR×ATR(14)
+    を建値基準の損切りラインとして通知に載せ、以後の確定 5分足の高値がラインに達したら FLAT（損切り）を通知する。
+    損切り後は SMA/環境足の条件が一度 FLAT に戻るまで再エントリーしない（backtest と同じ）。
 
 較正（Dukascopy 5分足 3年 2023-06〜2026-06、翌足始値執行、往復スプレッド USD 0.3 / AUD 0.7 pips、
 ショートの支払いスワップ USD 1.3 / AUD 0.8 pips/日 を保有時間按分で控除）
@@ -17,6 +20,10 @@
   AUD/JPY  ゲートなし -1059 / DD 1927 / 往復 673、 1hゲート  -590 / DD 1770 / 往復 471（3年中2年マイナス）
   → AUD/JPY は検証上マイナス。ユーザー判断で両ペアに適用（情報提供として使う）。
   ダウ鏡像を 5分/15分足の判定に使う構成は両ペアとも大きくマイナス（-561〜-4614）だった。
+  出口の追加検証（入口固定、2026-11-04）: USD/JPY は損切り 3×ATR で +1553（4年すべてプラス、年ごとの偏りが減る）、
+  5×ATR で +1639。利確・トレーリング・時間帯限定は改善しないか不安定。AUD/JPY はどの出口でもマイナスのまま
+  （損切り 3×ATR は -1095 に悪化）なので損切りは USD/JPY のみ既定で有効。
+  エントリー時の SMA50 乖離フィルタ（見送り/待ち、1〜6×ATR・10〜40pips）は両ペアとも効果なし。
 
 データ源: TWELVEDATA_API_KEY があれば Twelve Data（5分足・1時間足、週末の偽足は除外）。
 無ければ yfinance（5分足 5d、1時間足 1y）。無料枠（800/日）に収めるため、1時間足は
@@ -48,6 +55,8 @@ ENV_BARS = 5000              # 1時間足の取得本数（約 7 か月。ダウ
 ENV_GATE_DEFAULT = "1h"      # "1h" or "none"（環境変数 SHORT_ENV_GATE で上書き）
 ENV_REFRESH_MIN = 55         # 環境足の再取得間隔（分）。1時間足は 1 時間に 1 本しか増えない
 STALE_MINUTES = 30           # 最新確定 5分足がこれより古ければ市場クローズ中とみなす
+STOP_ATR_DEFAULT = 3.0       # 損切り幅（ATR 倍率）。環境変数 SHORT_STOP_ATR で上書き
+STOP_PAIRS_DEFAULT = ["USDJPY=X"]   # 損切りを適用するペア。環境変数 SHORT_STOP_PAIRS（空なら無効）
 SMA_SHORT = fx.SHORT_SMA     # 50
 SMA_LONG = fx.LONG_SMA       # 100
 ATR_PERIOD = fx.ATR_PERIOD   # 14
@@ -65,6 +74,22 @@ def short_pairs() -> list[str]:
 def env_gate() -> str:
     v = (os.environ.get("SHORT_ENV_GATE") or ENV_GATE_DEFAULT).strip().lower()
     return "none" if v in ("none", "off", "0", "") else "1h"
+
+
+def stop_atr_for(ticker: str) -> float | None:
+    """このペアの損切り幅（ATR 倍率）。対象外・0 以下なら None（損切りなし）。"""
+    env = os.environ.get("SHORT_STOP_PAIRS")
+    if env is None:
+        pairs = list(STOP_PAIRS_DEFAULT)
+    else:
+        pairs = [p.strip().upper().replace("=X", "") + "=X" for p in env.split(",") if p.strip()]
+    if ticker.upper() not in pairs:
+        return None
+    try:
+        k = float(os.environ.get("SHORT_STOP_ATR") or STOP_ATR_DEFAULT)
+    except ValueError:
+        k = STOP_ATR_DEFAULT
+    return k if k > 0 else None
 
 
 def state_path(ticker: str) -> Path:
@@ -241,6 +266,49 @@ def evaluate(df: pd.DataFrame, env: dict | None, gate: str = "1h",
     }
 
 
+def apply_stop(info: dict, prev: dict | None, df: pd.DataFrame, stop_atr: float | None) -> dict:
+    """損切りの状態遷移を info に反映して返す（prev は前回保存状態。None/初回なら何もしない）。
+
+    - 前回 SHORT で損切りライン保持中: 建玉足より後の確定 5分足の高値がラインに達していれば
+      FLAT（exit_reason="stop"、stopped=True）。達していなければ建値・ラインを引き継ぐ。
+    - 前回が損切り後の待機（stopped=True）: 規則がまだ SHORT なら FLAT のまま（再エントリー禁止）、
+      規則が FLAT に戻れば待機を解除する。
+    - 新規 SHORT（前回 FLAT → 今回 SHORT）: 建値＝開始足の終値、ライン＝建値 + stop_atr×ATR。
+    """
+    info.setdefault("stopped", False)
+    if not prev or prev.get("state") not in STATES:
+        return info
+    prev_state = prev["state"]
+    if info["state"] == STATE_SHORT and prev_state == STATE_SHORT:
+        line, entry_bar = prev.get("stop_line"), prev.get("entry_bar")
+        for k in ("entry_price", "entry_bar", "stop_line", "stop_atr"):
+            info[k] = prev.get(k)
+        if line is not None and entry_bar:
+            after = df[df.index > pd.Timestamp(entry_bar)]
+            if not after.empty and float(after["High"].max()) >= float(line):
+                info["state"] = STATE_FLAT
+                info["exit_reason"] = "stop"
+                info["stop_hit_high"] = float(after["High"].max())
+                info["stopped"] = True
+        return info
+    if info["state"] == STATE_SHORT and prev_state == STATE_FLAT:
+        if prev.get("stopped"):
+            info["state"] = STATE_FLAT          # 損切り後の待機中は再エントリーしない
+            info["stopped"] = True
+            return info
+        if stop_atr is not None and info.get("atr") is not None:
+            info["entry_price"] = info["price"]
+            info["entry_bar"] = df.index[-1].strftime("%Y-%m-%dT%H:%M")
+            info["stop_atr"] = stop_atr
+            info["stop_line"] = info["price"] + stop_atr * info["atr"]
+        return info
+    # 今回 FLAT（規則による手仕舞い、または待機継続）
+    info["stopped"] = False
+    if prev_state == STATE_SHORT:
+        info["exit_reason"] = "rule"
+    return info
+
+
 # ─────────────────────────────────────────────────────────────
 # 通知文
 # ─────────────────────────────────────────────────────────────
@@ -274,8 +342,18 @@ def format_message(info: dict, *, label: str, decimals: int = 3, first_run: bool
         return (f"🔔 {label} 5分足ショート監視を開始しました\n現在: *{st}*（{stance}）\n{sma}\n{env}\n"
                 f"判定: {rule} / {info['time']}")
     if st == STATE_SHORT:
+        stop = ""
+        exits = "SMA 再クロス、または環境足の下降終了で通知"
+        if info.get("stop_line") is not None:
+            stop = (f"損切り目安 {info['stop_line']:.{decimals}f}（建値 {info['entry_price']:.{decimals}f}"
+                    f" + {info.get('stop_atr', STOP_ATR_DEFAULT):g}×ATR）— 確定5分足の高値が達したら通知\n")
+            exits = "SMA 再クロス・環境足の下降終了・損切りライン到達で通知"
         return (f"🔻 {label} ショート開始シグナル（5分足 SMA{SMA_SHORT} が SMA{SMA_LONG} を下抜け）\n{sma}\n{env}\n"
-                f"→ 売り建てを検討。買い戻しは SMA 再クロス、または環境足の下降終了で通知\n{info['time']}")
+                f"{stop}→ 売り建てを検討。買い戻しは {exits}\n{info['time']}")
+    if info.get("exit_reason") == "stop":
+        return (f"🛑 {label} ショート損切りシグナル（損切りライン {info['stop_line']:.{decimals}f} に高値"
+                f" {info['stop_hit_high']:.{decimals}f} が到達）\n{sma}\n{env}\n"
+                f"→ 売り建ての買い戻しを検討。SMA/環境足が一度 FLAT に戻るまで再エントリーの合図は出しません\n{info['time']}")
     why = "SMA 再クロス" if info.get("raw_state") == STATE_FLAT else "環境足 1h の下降ダウ終了"
     return (f"⚪ {label} ショート手仕舞いシグナル（{why}）\n{sma}\n{env}\n"
             f"→ 売り建ての買い戻しを検討\n{info['time']}")
@@ -305,22 +383,29 @@ def process_pair(ticker: str) -> str:
     info["strategy"] = "short_5m"
 
     if prev_state is None:
+        info.setdefault("stopped", False)
         fx.notify(format_message(info, label=label, decimals=decimals, first_run=True))
         _save(path, info)
         print(f"[{label}] ショート監視 初回起動: 状態を {info['state']} で保存しました（{info['source']}）。")
         return "first_run"
+    apply_stop(info, prev, df, stop_atr_for(ticker))
     if prev_state == info["state"]:
-        print(f"[{label}] ショート 状態変化なし: {info['state']}（通知スキップ・{info['source']}）")
+        if bool(prev.get("stopped")) != bool(info.get("stopped")):
+            _save(path, info)   # 損切り後の待機解除（通知なし）
+        note = "・損切り後の待機中" if info.get("stopped") else ""
+        print(f"[{label}] ショート 状態変化なし: {info['state']}（通知スキップ{note}・{info['source']}）")
         return "nochange"
     fx.notify(format_message(info, label=label, decimals=decimals))
     _save(path, info)
-    print(f"[{label}] ショート 状態変化: {prev_state} → {info['state']}（{info['source']}）")
+    why = "損切り" if info.get("exit_reason") == "stop" else ""
+    print(f"[{label}] ショート 状態変化: {prev_state} → {info['state']}{why}（{info['source']}）")
     return "changed"
 
 
 def _save(path: Path, info: dict) -> None:
     payload = {k: info.get(k) for k in ("state", "raw_state", "price", "sma_short", "sma_long",
-                                        "env_down", "env_reentry_high", "env_resume_low", "gate", "source", "time")}
+                                        "env_down", "env_reentry_high", "env_resume_low", "gate", "source", "time",
+                                        "entry_price", "entry_bar", "stop_line", "stop_atr", "stopped", "exit_reason")}
     payload["strategy"] = "short_5m"
     payload["updated_at"] = datetime.now(TOKYO).strftime("%Y-%m-%d %H:%M:%S JST")
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
