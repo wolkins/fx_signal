@@ -11,6 +11,8 @@ cron.log
 state_*.json
 short_state_*.json
 short_env_*.json
+mtf_state_*.json
+td_cache_*.json
 gate_log.jsonl
 risk_log.jsonl
 data_health.json

@@ -191,7 +191,7 @@ def fetch_bars(ticker: str, now_utc: datetime | None = None) -> pd.DataFrame:
 
 
 def fetch_env_bars(ticker: str) -> pd.DataFrame:
-    df = td.fetch_ohlc(ticker, ENV_INTERVAL, ENV_BARS)
+    df = td.fetch_ohlc(ticker, ENV_INTERVAL, ENV_BARS, cache_min=ENV_REFRESH_MIN)
     if df is None or df.empty:
         df = _naive_utc(fx.fetch_data(ticker, interval="1h", period="1y"))
     if df is None or df.empty:

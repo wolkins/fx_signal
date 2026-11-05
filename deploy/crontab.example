@@ -21,6 +21,12 @@
 */5 * * * 2-5 /home/USER/fx_signal/deploy/run.sh --short >> /home/USER/fx_signal/cron.log 2>&1
 */5 0-6 * * 6 /home/USER/fx_signal/deploy/run.sh --short >> /home/USER/fx_signal/cron.log 2>&1
 
+# ふた山ショート（USD/JPY、mtf_short.py）: 平日 15 分おき。15分足の確定直後（:00/:15/:30/:45）はデータ源に
+#   まだ無いことがあるので 1 分ずらす。1時間足のキャッシュは short_signal と共用（消費 約 120/日）。
+1,16,31,46 7-23 * * 1 /home/USER/fx_signal/deploy/run.sh --mtf-short >> /home/USER/fx_signal/cron.log 2>&1
+1,16,31,46 * * * 2-5 /home/USER/fx_signal/deploy/run.sh --mtf-short >> /home/USER/fx_signal/cron.log 2>&1
+1,16,31,46 0-6 * * 6 /home/USER/fx_signal/deploy/run.sh --mtf-short >> /home/USER/fx_signal/cron.log 2>&1
+
 # 週次ハートビート（死活確認）。下は「火曜08:00」をサーバTZがJSTの場合の例。
 # サーバがUTCなら "0 23 * * 1"（月23:00 UTC = 火08:00 JST）にする。
 # ※ 既定の long_guard（日足）では鮮度を「確定日足が5日より古いか」で見るので、

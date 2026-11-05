@@ -13,10 +13,12 @@ API キーは環境変数 TWELVEDATA_API_KEY（fx-signal.env に書く）。未�
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -89,15 +91,40 @@ def parse_values(values: list[dict]) -> pd.DataFrame:
     return out.dropna(subset=["Close"]).sort_index()
 
 
+def cache_path(ticker: str, interval: str) -> Path:
+    code = ticker.replace("=X", "").replace("/", "").upper()
+    return Path(__file__).with_name(f"td_cache_{code}_{interval}.json")
+
+
+def _read_cache(path: Path, max_age_min: float, now: datetime) -> pd.DataFrame | None:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        at = datetime.fromisoformat(raw["fetched_at"])
+        if (now - at).total_seconds() > max_age_min * 60:
+            return None
+        return parse_values(raw["values"])
+    except (FileNotFoundError, KeyError, ValueError, OSError, json.JSONDecodeError):
+        return None
+
+
 def fetch_ohlc(ticker: str, interval: str = "5min", outputsize: int = 500, *,
-               key: str | None = None, weekend: bool = False) -> pd.DataFrame:
+               key: str | None = None, weekend: bool = False, cache_min: float = 0,
+               now_utc: datetime | None = None) -> pd.DataFrame:
     """Twelve Data から足を取る。失敗・キー未設定なら空の DataFrame（例外は投げない）。
 
     weekend=False（既定）で市場クローズ中の足を捨てる。進行中の足は呼び出し側で confirmed_only。
+    cache_min > 0 なら取得結果を td_cache_<PAIR>_<interval>.json に保存し、その分数以内は再取得しない
+    （1時間足など更新の遅い足を複数の監視で共用してクレジットを節約する）。
     """
     key = key or api_key()
     if not key:
         return pd.DataFrame()
+    now = now_utc or datetime.now(timezone.utc)
+    cpath = cache_path(ticker, interval)
+    if cache_min > 0:
+        cached = _read_cache(cpath, cache_min, now)
+        if cached is not None and not cached.empty:
+            return cached if weekend else drop_weekend(cached)
     params = {
         "symbol": symbol_for(ticker), "interval": interval, "outputsize": int(outputsize),
         "timezone": "UTC", "order": "desc", "apikey": key,
@@ -112,6 +139,12 @@ def fetch_ohlc(ticker: str, interval: str = "5min", outputsize: int = 500, *,
             data = None
         if isinstance(data, dict) and data.get("status") != "error" and data.get("values"):
             df = parse_values(data["values"])
+            if cache_min > 0:
+                try:
+                    cpath.write_text(json.dumps({"fetched_at": now.isoformat(), "values": data["values"]}) + "\n",
+                                     encoding="utf-8")
+                except OSError as exc:
+                    print(f"Twelve Data キャッシュ保存に失敗: {exc}", file=sys.stderr)
             return df if weekend else drop_weekend(df)
         if isinstance(data, dict):
             last_err = f"{data.get('code')}: {data.get('message')}"

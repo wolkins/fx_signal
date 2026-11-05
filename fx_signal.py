@@ -844,4 +844,8 @@ if __name__ == "__main__":
         # 5分足ショート監視（USD/JPY・AUD/JPY）。ロング保護とは独立の state/通知。short_signal.py 参照
         import short_signal
         sys.exit(short_signal.main())
+    if "--mtf-short" in sys.argv:
+        # ふた山ショート（4h 鏡像ダウ＋1h ふた山＋15m 安値割れ、USD/JPY）。mtf_short.py 参照
+        import mtf_short
+        sys.exit(mtf_short.main())
     sys.exit(main())

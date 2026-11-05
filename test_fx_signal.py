@@ -1229,6 +1229,171 @@ def test_short_pairs_env_and_cache(tmp_path=None):
             assert ss.load_env("USDJPY=X", now + timedelta(minutes=70)) == env and len(calls) == 2
 
 
+# ─────────────────────────────────────────────────────────────
+# ふた山ショート（mtf_short.py）
+# ─────────────────────────────────────────────────────────────
+import numpy as np  # noqa: E402
+import mtf_short as ms  # noqa: E402
+
+
+def _zigzag(segs, start=100.0, step=0.01):
+    """segs: [(本数, 方向±1), ...] → 終値列。"""
+    out = [start]
+    for n, d in segs:
+        for _ in range(n):
+            out.append(out[-1] + d * step)
+    return out
+
+
+def _bars(closes, start, freq):
+    idx = pd.date_range(start, periods=len(closes), freq=freq)
+    c = pd.Series(closes, index=idx, dtype=float)
+    return pd.DataFrame({"Open": c.shift(1).fillna(c), "High": c + 0.02, "Low": c - 0.02, "Close": c})
+
+
+def test_mtf_swing_track_and_short_dow():
+    # 上 12 / 下 12 / 上 10 / 下 14（安値更新）/ 上 20（戻り高値超え）
+    b = _bars(_zigzag([(12, 1), (12, -1), (10, 1), (14, -1), (20, 1)]), "2026-01-05", "4h")
+    st = ms.swing_track(b)
+    assert st["lastH"][-1] is not None and st["lastL"][-1] is not None
+    # 採用済み山谷は交互で、間隔は MIN_WAVE 以上
+    lists = ms.swing_track(b, keep_list=True)["lists"][-1]
+    kinds = [p.kind for p in lists]
+    assert all(a != b_ for a, b_ in zip(kinds, kinds[1:]))
+    assert all(q.pos - p.pos >= ms.MW for p, q in zip(lists, lists[1:]))
+    down, kh, lb, _ = ms.short_dow(b)
+    # 1 回目の谷（pos 24, 終値 100.00 / Low 99.98）を終値で割る → DOWN。実質戻り高値は直前の山（pos 34）の High
+    first_down = int(np.argmax(down))
+    assert down[first_down] and b["Close"].iloc[first_down] < 99.98 and first_down > 34
+    assert abs(kh[first_down] - b["High"].iloc[34]) < 1e-9
+    # 最後の上昇で戻り高値を終値で超える → 下降終了
+    assert not down[-1] and np.isnan(kh[-1])
+
+
+def test_mtf_h4_context_zone_and_retrace():
+    # 下降継続中: 割った押し安値（谷）の帯がゾーンになり、80% 水準は直近の山→谷から
+    b = ms.with_end(_bars(_zigzag([(12, 1), (12, -1), (10, 1), (14, -1), (1, 1)]), "2026-01-05", "4h"), "4h")
+    ctx = ms.h4_context(b)
+    i = len(b) - 1
+    assert ctx["down"][i]
+    # 現在値 99.97 より上にある採用済み谷 = pos 24 の谷（Low 99.98）。帯 = [Low, min(Open, Close)]
+    assert abs(ctx["zone_lo"][i] - b["Low"].iloc[24]) < 1e-9 and abs(ctx["zone_hi"][i] - min(b["Open"].iloc[24], b["Close"].iloc[24])) < 1e-9
+    assert ctx["zone_lo"][i] > b["Close"].iloc[i]
+    L = ms.swing_track(b)["lastL"][i]; H = [p for p in ms.swing_track(b, keep_list=True)["lists"][i] if p.kind == "H" and p.pos < L.pos][-1]
+    assert abs(ctx["ret_lim"][i] - (L.price + 0.8 * (H.price - L.price))) < 1e-9
+    assert pd.Timestamp(ctx["lastL_time"][i]) == b.index[L.pos]
+
+
+def _fake_ctx4(b4, down=True, zone=(99.95, 100.05), key_high=100.6):
+    n = len(b4)
+    return dict(down=np.full(n, down), key_high=np.full(n, key_high if down else np.nan),
+                zone_lo=np.full(n, zone[0] if down else np.nan), zone_hi=np.full(n, zone[1] if down else np.nan),
+                ret_lim=np.full(n, np.nan), lastL_time=np.full(n, np.datetime64("2026-01-01"), dtype="datetime64[ns]"),
+                end=b4["end"].to_numpy())
+
+
+def _fake_setup(top, top_time, valid=True):
+    def f(b1, ctx4, top_tol=ms.TOP_TOL):
+        n = len(b1)
+        return dict(valid=np.full(n, valid), top=np.full(n, top), top_low=np.full(n, top - 0.03),
+                    top_time=np.full(n, np.datetime64(top_time), dtype="datetime64[ns]"), atr=np.full(n, 0.05),
+                    end=b1["end"].to_numpy(), m41=np.searchsorted(ctx4["end"], b1["end"].to_numpy(), side="right") - 1)
+    return f
+
+
+def test_mtf_process_pair_entry_exits_and_armed():
+    """15m: 上12→下12(谷 99.78)→上10→下10(谷割れ=エントリー)→上12(15m 高値超え=手仕舞い)。
+    ふた山成立の通知は 1 回だけ。損切り・4h 終了の手仕舞いも確認。"""
+    sent: list[str] = []
+    base = _zigzag([(12, 1), (12, -1), (10, 1)], start=100.0, step=0.01)   # 谷は pos 24: 終値 100.00 / Low 99.98
+    pre = _bars(base, "2026-11-02 00:00", "15min")
+    entry = _bars(_zigzag([(12, 1), (12, -1), (10, 1), (10, -1)]), "2026-11-02 00:00", "15min")   # 終値 100.00（Low 99.98 をまだ割らない）
+    deeper = _bars(_zigzag([(12, 1), (12, -1), (10, 1), (13, -1)]), "2026-11-02 00:00", "15min")  # 終値 99.97 < 99.98 → 割れ
+    rally = _bars(_zigzag([(12, 1), (12, -1), (10, 1), (13, -1), (20, 1)]), "2026-11-02 00:00", "15min")  # 100.17 まで戻す（15m 高値 100.12 超え）
+    for d in (pre, entry, deeper, rally):
+        d.attrs["source"] = "test"
+    b1 = _bars(_zigzag([(300, 1)], start=90.0), "2026-10-01", "1h")
+    cur = {"b15": pre, "down": True, "top": 101.0}
+    real_eval = ms.evaluate
+    with tempfile.TemporaryDirectory() as d, no_env("MTF_SHORT_PAIRS"):
+        sp = Path(d) / "mtf_state_USDJPY.json"
+        with patched(ms, state_path=lambda t: sp, fetch_entry_bars=lambda t, now_utc=None: cur["b15"],
+                     fetch_env_bars=lambda t, now_utc=None: b1,
+                     h4_context=lambda b4: _fake_ctx4(b4, down=cur["down"]),
+                     h1_setup=lambda b1_, ctx4, top_tol=ms.TOP_TOL: _fake_setup(cur["top"], "2026-11-02T00:00")(b1_, ctx4),
+                     evaluate=lambda b15, b1_, prev, now_utc=None: real_eval(
+                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc))), \
+             patched(fx, notify=sent.append):
+            assert ms.pairs() == ["USDJPY=X"]
+            assert ms.process_pair("USDJPY=X") == "first_run" and "監視を開始" in sent[-1]
+            st = fx.load_state(sp); assert st["state"] == "FLAT" and st["armed_time"] == "2026-11-02T00:00"
+            assert ms.process_pair("USDJPY=X") == "nochange" and len(sent) == 1       # 同じふた山は再通知しない
+            cur["b15"] = entry
+            assert ms.process_pair("USDJPY=X") == "nochange"                          # 谷 Low 99.86 をまだ割っていない
+            cur["b15"] = deeper
+            assert ms.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("🔻") and "15m 安値 99.980" in sent[-1]
+            st = fx.load_state(sp)
+            assert st["state"] == "SHORT" and abs(st["hard_sl"] - (101.0 + 0.1 * 0.05)) < 1e-9 and st["entry_bar"] == deeper.index[-1].strftime("%Y-%m-%dT%H:%M")
+            assert ms.process_pair("USDJPY=X") == "nochange" and len(sent) == 2
+            cur["b15"] = rally
+            assert ms.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("⚪") and "15m 直近高値" in sent[-1]
+            assert fx.load_state(sp)["exit_reason"] == "high_15m"
+    # ふた山成立の通知は armed_time（2番天井時刻）が変わった時に 1 回。損切り・4h 終了も確認。
+    sent.clear()
+    cur = {"b15": pre, "down": True, "top": 101.0, "tt": "2026-11-02T00:00"}
+    with tempfile.TemporaryDirectory() as d, no_env("MTF_SHORT_PAIRS"):
+        sp = Path(d) / "mtf_state_USDJPY.json"
+        with patched(ms, state_path=lambda t: sp, fetch_entry_bars=lambda t, now_utc=None: cur["b15"],
+                     fetch_env_bars=lambda t, now_utc=None: b1,
+                     h4_context=lambda b4: _fake_ctx4(b4, down=cur["down"]),
+                     h1_setup=lambda b1_, ctx4, top_tol=ms.TOP_TOL: _fake_setup(cur["top"], cur["tt"])(b1_, ctx4),
+                     evaluate=lambda b15, b1_, prev, now_utc=None: real_eval(
+                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc))), \
+             patched(fx, notify=sent.append):
+            assert ms.process_pair("USDJPY=X") == "first_run"
+            cur["tt"] = "2026-11-02T01:00"
+            assert ms.process_pair("USDJPY=X") == "armed" and sent[-1].startswith("👀") and len(sent) == 2
+            assert ms.process_pair("USDJPY=X") == "nochange" and len(sent) == 2
+            # 損切り
+            cur["b15"] = deeper; cur["top"] = 99.9
+            assert ms.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("🔻")
+            cur["b15"] = rally
+            assert ms.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("🛑") and fx.load_state(sp)["exit_reason"] == "stop"
+            # 4h 下降終了
+            cur["b15"] = deeper; cur["top"] = 101.0
+            assert ms.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("🔻")
+            cur["down"] = False
+            assert ms.process_pair("USDJPY=X") == "changed" and "4h の下降ダウ終了" in sent[-1]
+            assert fx.load_state(sp)["exit_reason"] == "env_end"
+            # 4h が下降でなければ、谷を割ってもエントリーしない
+            assert ms.process_pair("USDJPY=X") == "nochange"
+            cur["b15"] = pd.DataFrame()
+            assert ms.process_pair("USDJPY=X") == "fetch_failed"
+
+
+def test_twelvedata_bar_cache():
+    calls = []
+    vals = [{"datetime": "2026-11-03 10:00:00", "open": "1", "high": "1.1", "low": "0.9", "close": "1.0"},
+            {"datetime": "2026-11-03 09:00:00", "open": "1", "high": "1.1", "low": "0.9", "close": "1.0"}]
+
+    class R:
+        def json(self):
+            calls.append(1)
+            return {"status": "ok", "values": vals}
+    with tempfile.TemporaryDirectory() as d:
+        cp = Path(d) / "td_cache_USDJPY_1h.json"
+        now = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+        with patched(td, cache_path=lambda t, i: cp), patched(td.requests, get=lambda *a, **k: R()):
+            df = td.fetch_ohlc("USDJPY=X", "1h", 10, key="k", cache_min=55, now_utc=now)
+            assert len(df) == 2 and len(calls) == 1 and cp.exists()
+            df2 = td.fetch_ohlc("USDJPY=X", "1h", 10, key="k", cache_min=55, now_utc=now + timedelta(minutes=30))
+            assert len(df2) == 2 and len(calls) == 1                      # キャッシュ内 → 再取得しない
+            td.fetch_ohlc("USDJPY=X", "1h", 10, key="k", cache_min=55, now_utc=now + timedelta(minutes=70))
+            assert len(calls) == 2                                         # 期限切れ → 再取得
+            td.fetch_ohlc("USDJPY=X", "1h", 10, key="k", now_utc=now)
+            assert len(calls) == 3                                         # cache_min=0 は常に取得
+
+
 def _run_all() -> int:
     tests = sorted(
         (name, obj)
