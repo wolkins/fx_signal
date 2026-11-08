@@ -54,13 +54,14 @@ def patched(obj, **attrs):
 
 
 @contextlib.contextmanager
-def no_env(key):
-    saved = os.environ.pop(key, None)
+def no_env(*keys):
+    saved = {k: os.environ.pop(k, None) for k in keys}
     try:
         yield
     finally:
-        if saved is not None:
-            os.environ[key] = saved
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
 
 
 SIG = {"state": "LONG", "price": 159.2, "change_15m_pct": 0.0, "change_1h_pct": 0.1}
@@ -1317,12 +1318,12 @@ def test_mtf_process_pair_entry_exits_and_armed():
     real_eval = ms.evaluate
     with tempfile.TemporaryDirectory() as d, no_env("MTF_SHORT_PAIRS"):
         sp = Path(d) / "mtf_state_USDJPY.json"
-        with patched(ms, state_path=lambda t: sp, fetch_entry_bars=lambda t, now_utc=None: cur["b15"],
+        with patched(ms, state_path=lambda t, side="short": sp, fetch_entry_bars=lambda t, now_utc=None: cur["b15"],
                      fetch_env_bars=lambda t, now_utc=None: b1,
                      h4_context=lambda b4: _fake_ctx4(b4, down=cur["down"]),
                      h1_setup=lambda b1_, ctx4, top_tol=ms.TOP_TOL: _fake_setup(cur["top"], "2026-11-02T00:00")(b1_, ctx4),
-                     evaluate=lambda b15, b1_, prev, now_utc=None: real_eval(
-                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc))), \
+                     evaluate=lambda b15, b1_, prev, now_utc=None, side="short": real_eval(
+                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc), side=side)), \
              patched(fx, notify=sent.append):
             assert ms.pairs() == ["USDJPY=X"]
             assert ms.process_pair("USDJPY=X") == "first_run" and "監視を開始" in sent[-1]
@@ -1337,18 +1338,18 @@ def test_mtf_process_pair_entry_exits_and_armed():
             assert ms.process_pair("USDJPY=X") == "nochange" and len(sent) == 2
             cur["b15"] = rally
             assert ms.process_pair("USDJPY=X") == "changed" and sent[-1].startswith("⚪") and "15m 直近高値" in sent[-1]
-            assert fx.load_state(sp)["exit_reason"] == "high_15m"
+            assert fx.load_state(sp)["exit_reason"] == "exit_15m"
     # ふた山成立の通知は armed_time（2番天井時刻）が変わった時に 1 回。損切り・4h 終了も確認。
     sent.clear()
     cur = {"b15": pre, "down": True, "top": 101.0, "tt": "2026-11-02T00:00"}
     with tempfile.TemporaryDirectory() as d, no_env("MTF_SHORT_PAIRS"):
         sp = Path(d) / "mtf_state_USDJPY.json"
-        with patched(ms, state_path=lambda t: sp, fetch_entry_bars=lambda t, now_utc=None: cur["b15"],
+        with patched(ms, state_path=lambda t, side="short": sp, fetch_entry_bars=lambda t, now_utc=None: cur["b15"],
                      fetch_env_bars=lambda t, now_utc=None: b1,
                      h4_context=lambda b4: _fake_ctx4(b4, down=cur["down"]),
                      h1_setup=lambda b1_, ctx4, top_tol=ms.TOP_TOL: _fake_setup(cur["top"], cur["tt"])(b1_, ctx4),
-                     evaluate=lambda b15, b1_, prev, now_utc=None: real_eval(
-                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc))), \
+                     evaluate=lambda b15, b1_, prev, now_utc=None, side="short": real_eval(
+                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc), side=side)), \
              patched(fx, notify=sent.append):
             assert ms.process_pair("USDJPY=X") == "first_run"
             cur["tt"] = "2026-11-02T01:00"
@@ -1369,6 +1370,65 @@ def test_mtf_process_pair_entry_exits_and_armed():
             assert ms.process_pair("USDJPY=X") == "nochange"
             cur["b15"] = pd.DataFrame()
             assert ms.process_pair("USDJPY=X") == "fetch_failed"
+
+
+def test_mtf_long_is_mirror_of_short():
+    """ロングは価格を上下反転してショートの規則を当てる。実価格 = 200 − ショート試験の価格（2番底 99.0、15m 高値 100.02）。
+    鏡像空間に渡る偽 ctx/setup は符号反転した値で与える。両方向を main() で回すと足の取得は 1 回。"""
+    sent: list[str] = []
+    def flip(df):
+        out = pd.DataFrame({"Open": 200 - df["Open"], "High": 200 - df["Low"], "Low": 200 - df["High"], "Close": 200 - df["Close"]}, index=df.index)
+        out.attrs["source"] = "test"
+        return out
+    pre = flip(_bars(_zigzag([(12, 1), (12, -1), (10, 1)]), "2026-11-02 00:00", "15min"))                # 15m 山は pos 24: Close 100.00 / High 100.02
+    brk = flip(_bars(_zigzag([(12, 1), (12, -1), (10, 1), (13, -1)]), "2026-11-02 00:00", "15min"))      # 終値 100.03 > 100.02 → 上抜け
+    drop = flip(_bars(_zigzag([(12, 1), (12, -1), (10, 1), (13, -1), (20, 1)]), "2026-11-02 00:00", "15min"))  # 99.83 まで下げる（15m 安値割れ）
+    b1 = flip(_bars(_zigzag([(300, 1)], start=90.0), "2026-10-01", "1h"))
+    cur = {"b15": pre, "up": True, "bottom": 99.0}
+    real_eval = ms.evaluate
+    fetches = []
+    with tempfile.TemporaryDirectory() as d, no_env("MTF_SHORT_PAIRS", "MTF_LONG_PAIRS"):
+        paths = {"short": Path(d) / "mtf_state_USDJPY.json", "long": Path(d) / "mtf_state_long_USDJPY.json"}
+        with patched(ms, state_path=lambda t, side="short": paths[side],
+                     fetch_entry_bars=lambda t, now_utc=None: (fetches.append(t), cur["b15"])[1],
+                     fetch_env_bars=lambda t, now_utc=None: b1,
+                     h4_context=lambda b4: _fake_ctx4(b4, down=cur["up"], zone=(-100.05, -99.95), key_high=-99.4),   # 鏡像空間
+                     h1_setup=lambda b1_, ctx4, top_tol=ms.TOP_TOL: _fake_setup(-cur["bottom"], "2026-11-02T00:00")(b1_, ctx4),
+                     evaluate=lambda b15, b1_, prev, now_utc=None, side="short": real_eval(
+                         b15, b1_, prev, now_utc=(b15.index[-1] + pd.Timedelta(minutes=16)).to_pydatetime().replace(tzinfo=timezone.utc), side=side)), \
+             patched(fx, notify=sent.append):
+            assert ms.pairs("long") == ["USDJPY=X"] and ms.state_path("USDJPY=X", "long").name == "mtf_state_long_USDJPY.json"
+            assert ms.process_pair("USDJPY=X", "long") == "first_run"
+            m = sent[-1]
+            assert "ふた山ロング監視を開始" in m and "上昇ダウ継続" in m and "実質押し安値 99.400" in m
+            assert "直撃エリア（抜けた戻り高値の帯）: 99.950〜100.050" in m and "安い方 99.000" in m
+            st = fx.load_state(paths["long"])
+            assert st["state"] == "FLAT" and st["strategy"] == "mtf_long" and abs(st["trig_15m"] - 100.02) < 1e-9
+            cur["b15"] = brk
+            assert ms.process_pair("USDJPY=X", "long") == "changed" and sent[-1].startswith("🔺") and "15m 高値 100.020 を終値で上抜け" in sent[-1]
+            st = fx.load_state(paths["long"])
+            assert st["state"] == "LONG" and abs(st["hard_sl"] - (99.0 - 0.1 * 0.05)) < 1e-9 and abs(st["entry_price"] - float(brk["Close"].iloc[-1])) < 1e-9
+            assert ms.process_pair("USDJPY=X", "long") == "nochange"
+            cur["b15"] = drop
+            assert ms.process_pair("USDJPY=X", "long") == "changed" and sent[-1].startswith("⚪") and "15m 直近安値" in sent[-1]
+            assert fx.load_state(paths["long"])["exit_reason"] == "exit_15m"
+            # 損切り: 2番底を 99.9 に上げると 15m 安値割れより先に Low がラインに届く
+            cur["b15"] = brk; cur["bottom"] = 99.9
+            assert ms.process_pair("USDJPY=X", "long") == "changed" and sent[-1].startswith("🔺")
+            cur["b15"] = drop
+            assert ms.process_pair("USDJPY=X", "long") == "changed" and sent[-1].startswith("🛑") and "に安値" in sent[-1]
+            assert fx.load_state(paths["long"])["exit_reason"] == "stop"
+            # 4h 上昇終了
+            cur["b15"] = brk; cur["bottom"] = 99.0
+            assert ms.process_pair("USDJPY=X", "long") == "changed"
+            cur["up"] = False
+            assert ms.process_pair("USDJPY=X", "long") == "changed" and "4h の上昇ダウ終了" in sent[-1]
+            # 同じペアを両方向で回すと 15m 足の取得は 1 回。ショート側は（偽 ctx で）初回起動になる
+            fetches.clear(); cur["up"] = True
+            n0 = len(sent)
+            assert ms.main(("short", "long")) == 0 and fetches == ["USDJPY=X"]
+            assert fx.load_state(paths["short"])["strategy"] == "mtf_short" and "ふた山ショート監視を開始" in sent[n0]
+            assert fx.load_state(paths["long"])["state"] == "LONG" and sent[n0 + 1].startswith("🔺")   # ロングは再エントリー
 
 
 def test_twelvedata_bar_cache():
